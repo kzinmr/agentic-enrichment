@@ -1,10 +1,10 @@
-# agent-native
+# agent-enrichment
 
-A working prototype of an **agent-native RLM (Retrieval-based LM) stack** built around Databricks `call_records`. Two Python packages — `cu-agent-rlm` (Content Understanding) and `qu-agent-rlm` (Query Understanding) — exchange catalog, evidence, and feedback through structured JSON artifacts, forming a self-improving outer loop that an orchestration runner can drive end-to-end with a single command.
+A working prototype of an **agent-native RLM (Retrieval-based LM) stack** built around `call_records` table. Two Python packages — `cu-agent-rlm` (Content Understanding) and `qu-agent-rlm` (Query Understanding) — exchange catalog, evidence, and feedback through structured JSON artifacts, forming a self-improving outer loop that an orchestration runner can drive end-to-end with a single command.
 
 The core design rule is simple: **the root agent never sees a raw transcript**. Every reference goes through `chunk:<id>`, every LLM call is wrapped by a validator, and every mutable piece of state (schema, prompts, queries) is versioned and gated.
 
-For the full architecture, read [`docs/architecture.en.md`](docs/architecture.en.md) and open [`docs/architecture.en.html`](docs/architecture.en.html) for the visualization. Japanese versions are also available as [`architecture.md`](docs/architecture.md) / [`architecture.html`](docs/architecture.html).
+For the full architecture, read [`docs/architecture.en.md`](docs/architecture.en.md) and open [`docs/architecture.en.html`](docs/architecture.en.html) for the visualization.
 
 ---
 
