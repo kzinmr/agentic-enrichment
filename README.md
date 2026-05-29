@@ -1,6 +1,6 @@
 # agent-enrichment
 
-A working prototype of an **agent-native RLM (Retrieval-based LM) stack** built around `call_records` table. Two Python packages — `cu-agent-rlm` (Content Understanding) and `qu-agent-rlm` (Query Understanding) — exchange catalog, evidence, and feedback through structured JSON artifacts, forming a self-improving outer loop that an orchestration runner can drive end-to-end with a single command.
+A working prototype of an **RLM-like agentic enrichment loop for retrieval and analysis** built around unstructured transcription table. Two Python packages — `cu-agent-rlm` (Content Understanding) and `qu-agent-rlm` (Query Understanding) — exchange catalog, evidence, and feedback through structured JSON artifacts, forming a self-improving outer loop that an orchestration runner can drive end-to-end with a single command.
 
 The core design rule is simple: **the root agent never sees a raw transcript**. Every reference goes through `chunk:<id>`, every LLM call is wrapped by a validator, and every mutable piece of state (schema, prompts, queries) is versioned and gated.
 
