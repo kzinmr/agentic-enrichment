@@ -1,0 +1,612 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+
+workspace = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(workspace / "cu-agent-rlm" / "src"))
+
+from cu_agent_rlm.pipeline import run_content_understanding
+from cu_agent_rlm.schema import StaticSchemaInducer
+from qu_agent_rlm.agent import QueryUnderstandingAgent, SearchExecutionPolicy
+from qu_agent_rlm.cli import append_feedback, parse_args
+from qu_agent_rlm.corpus import SilverCorpus, ToolEvent
+from qu_agent_rlm.eval import run_eval
+from qu_agent_rlm.judge import LLMAnswerJudge
+from qu_agent_rlm.llm import DEFAULT_OPENAI_MODEL
+from qu_agent_rlm.planner import LLMQueryPlanner, QueryPlan, QueryToolStep
+from qu_agent_rlm.query_tasks import (
+    LLMDownstreamQueryGenerator,
+    adjusted_for_cu_schema,
+    build_heuristic_bootstrap_tasks,
+    dedupe_query_tasks,
+)
+from qu_agent_rlm.retrieval import BM25Index
+
+
+class QueryUnderstandingRLMTest(unittest.TestCase):
+    def test_filters_aggregate_and_evaluates_cu_artifacts(self) -> None:
+        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        source_sql = workspace / "call_records.sql"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            agent = QueryUnderstandingAgent(SilverCorpus.from_dir(output))
+
+            security = agent.answer("Which calls mention security review or access controls?")
+            self.assertEqual(security["plan"]["filters"]["security_review_requested"], True)
+            self.assertGreaterEqual(len(security["plan"]["steps"]), 4)
+            self.assertIn("query_silver", [event["tool"] for event in security["trace"]])
+            self.assertIn("bm25_search_chunks", [event["tool"] for event in security["trace"]])
+            self.assertIn("review_schema_gaps", [event["tool"] for event in security["trace"]])
+            self.assertTrue(security["records"])
+            self.assertTrue(security["evidence"])
+
+            pricing = agent.answer("Which accounts have pricing objections or pricing blocked deals?")
+            self.assertEqual(pricing["plan"]["filters"]["renewal_risk"], "pricing_pushback")
+            self.assertTrue({record["call_id"] for record in pricing["records"]}.issuperset({"call-002", "call-005", "call-006"}))
+
+            aggregate = agent.answer("Count calls by product area.")
+            self.assertEqual(aggregate["plan"]["operation"], "aggregate")
+            self.assertEqual(aggregate["plan"]["group_by"], "product_area")
+            self.assertIn("crm", aggregate["aggregation"])
+
+            eval_report = run_eval(agent, output / "evaluation_tasks.json")
+            self.assertEqual(eval_report["passed"], eval_report["task_count"])
+
+    def test_agent_accepts_injected_planner(self) -> None:
+        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        source_sql = workspace / "call_records.sql"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            agent = QueryUnderstandingAgent(SilverCorpus.from_dir(output), planner=StaticPlanner())
+
+            result = agent.answer("Find anything relevant.")
+
+            self.assertEqual(result["plan"]["planner"], "static")
+            self.assertEqual(result["plan"]["operation"], "filter")
+            self.assertTrue(result["records"])
+
+    def test_llm_planner_maps_json_to_valid_plan(self) -> None:
+        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        source_sql = workspace / "call_records.sql"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            corpus = SilverCorpus.from_dir(output)
+            planner = LLMQueryPlanner(
+                FakeJSONClient(
+                    {
+                        "operation": "aggregate",
+                        "filters": {"security_review_requested": True},
+                        "group_by": "product_area",
+                        "retrieve_evidence": True,
+                        "ranking_query": "security review product areas",
+                        "reasoning": "The user asked for a grouped count.",
+                    }
+                )
+            )
+            agent = QueryUnderstandingAgent(corpus, planner=planner)
+
+            result = agent.answer("Break down security review calls by product area.")
+
+            self.assertEqual(result["plan"]["planner"], "fake-llm")
+            self.assertEqual(result["plan"]["operation"], "aggregate")
+            self.assertEqual(result["plan"]["filters"], {"security_review_requested": True})
+            self.assertEqual(result["plan"]["group_by"], "product_area")
+            self.assertTrue(result["aggregation"])
+            self.assertEqual(result["prompt_state"]["planner"]["prompt_id"], "qu.query_planner")
+            self.assertIn("prompt_hash", result["prompt_state"]["planner"])
+
+    def test_search_only_query_emits_column_request_for_cu_feedback(self) -> None:
+        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        source_sql = workspace / "call_records.sql"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "corpus"
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            agent = QueryUnderstandingAgent(SilverCorpus.from_dir(output))
+
+            result = agent.answer("Which calls mention founder-led sales calls?")
+
+            self.assertEqual(result["plan"]["operation"], "search")
+            self.assertTrue(result["records"])
+            self.assertTrue(result["column_requests"])
+            self.assertEqual(result["column_requests"][0]["action"], "add_field")
+            self.assertIn("founder", result["column_requests"][0]["field_name"])
+
+            feedback_path = Path(tmp) / "feedback" / "column_requests.jsonl"
+            append_feedback(feedback_path, result, corpus_path=output)
+            self.assertTrue(feedback_path.exists())
+            feedback_payload = json.loads(feedback_path.read_text(encoding="utf-8"))
+            self.assertIn("column_requests", feedback_payload)
+            self.assertIn("search_diagnostics", feedback_payload)
+            self.assertIn("judgement", feedback_payload)
+
+    def test_embedding_search_tool_is_agent_callable(self) -> None:
+        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        source_sql = workspace / "call_records.sql"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "corpus"
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            corpus = SilverCorpus.from_dir(output, embedding_client=FakeEmbeddingClient())
+            agent = QueryUnderstandingAgent(corpus, planner=EmbeddingSearchPlanner())
+
+            result = agent.answer("Find founder led conversations.", limit=1)
+
+            self.assertEqual(result["records"][0]["call_id"], "call-005")
+            self.assertIn("embedding_search_chunks", [event["tool"] for event in result["trace"]])
+
+    def test_search_iteration_rejects_duplicate_and_reranks_candidates(self) -> None:
+        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        source_sql = workspace / "call_records.sql"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "corpus"
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            corpus = SilverCorpus.from_dir(output, embedding_client=FakeEmbeddingClient())
+            agent = QueryUnderstandingAgent(
+                corpus,
+                search_controller=FakeSequenceJSONClient(
+                    [
+                        {
+                            "action": "search",
+                            "tool": "bm25_search_chunks",
+                            "query": "Which calls mention founder-led sales calls?",
+                            "limit": 2,
+                            "reason": "This intentionally repeats the initial retrieval.",
+                        }
+                    ]
+                ),
+                reranker=FakeSequenceJSONClient(
+                    [
+                        {
+                            "ranked_chunks": [
+                                {"chunk_id": "call-001:chunk-001", "relevance": 0.9, "reason": "Test rerank order."},
+                                {"chunk_id": "call-005:chunk-001", "relevance": 0.8, "reason": "Test rerank order."},
+                            ],
+                            "reasoning": "Reranked by fixture.",
+                        }
+                    ],
+                    provider_name="fake-reranker",
+                ),
+                search_policy=SearchExecutionPolicy(min_calls=2, max_iterations=1),
+            )
+
+            result = agent.answer("Which calls mention founder-led sales calls?", limit=2)
+
+            trace_tools = [event["tool"] for event in result["trace"]]
+            self.assertIn("search_iteration:rejected", trace_tools)
+            self.assertIn("embedding_search_chunks", trace_tools)
+            self.assertIn("llm_rerank:fake-reranker", trace_tools)
+            self.assertEqual(result["records"][0]["call_id"], "call-001")
+            self.assertGreaterEqual(len(result["search_diagnostics"]["calls"]), 2)
+
+    def test_agent_accepts_specialized_retrieval_subagent(self) -> None:
+        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        source_sql = workspace / "call_records.sql"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "corpus"
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            corpus = SilverCorpus.from_dir(output, embedding_client=FakeEmbeddingClient())
+            agent = QueryUnderstandingAgent(
+                corpus,
+                retrieval_subagent=Sid1StyleRetrievalSubAgent(),
+            )
+
+            result = agent.answer("Which calls mention founder-led sales calls?", limit=2)
+
+            trace_tools = [event["tool"] for event in result["trace"]]
+            self.assertIn("embedding_search_chunks", trace_tools)
+            self.assertIn("retrieval_subagent:sid1-fixture", trace_tools)
+            self.assertEqual(result["search_diagnostics"]["subagent"], "sid1-fixture")
+
+    def test_search_failure_generates_schema_gap_request(self) -> None:
+        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        source_sql = workspace / "call_records.sql"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "corpus"
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            agent = QueryUnderstandingAgent(SilverCorpus.from_dir(output))
+
+            result = agent.answer("Which calls mention zzzqv impossible terminology?")
+
+            self.assertFalse(result["records"])
+            self.assertTrue(result["search_diagnostics"]["failures"])
+            self.assertFalse(result["judgement"]["success"])
+            self.assertIn("no_records", result["judgement"]["failure_modes"])
+            self.assertTrue(result["column_requests"])
+            self.assertIn("Search diagnostics", result["column_requests"][0]["reason"])
+
+    def test_llm_answer_judge_can_emit_feedback_without_planner_column_request(self) -> None:
+        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        source_sql = workspace / "call_records.sql"
+        judge_payload = {
+            "answerable": True,
+            "evidence_sufficient": True,
+            "success": True,
+            "needs_cu_feedback": True,
+            "confidence": "medium",
+            "failure_modes": ["schema_gap"],
+            "missing_field_requests": [
+                {
+                    "action": "add_field",
+                    "field_name": "security_evidence_type",
+                    "field_type": "list",
+                    "description": "Reusable security evidence category.",
+                    "reason": "Judge found that answers would be easier to verify with a reusable evidence type.",
+                    "priority": "medium",
+                    "suggested_allowed_values": ["sso", "audit_logs"],
+                    "example_queries": ["Which calls mention security review or access controls?"],
+                    "evidence_refs": ["chunk:call-001:chunk-001"],
+                }
+            ],
+            "rationale": "The answer is supported, but schema can improve reusable security evidence.",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "corpus"
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            agent = QueryUnderstandingAgent(
+                SilverCorpus.from_dir(output),
+                answer_judge=LLMAnswerJudge(FakeJSONClient(judge_payload)),
+            )
+
+            result = agent.answer("Which calls mention security review or access controls?")
+
+            self.assertEqual(result["judgement"]["judge"], "fake-llm")
+            self.assertTrue(result["judgement"]["needs_cu_feedback"])
+            self.assertEqual(result["prompt_state"]["answer_judge"]["prompt_id"], "qu.answer_judge")
+            self.assertEqual(result["column_requests"], [])
+            self.assertIn("answer_judge:fake-llm", [event["tool"] for event in result["trace"]])
+
+            feedback_path = Path(tmp) / "feedback" / "column_requests.jsonl"
+            append_feedback(feedback_path, result, corpus_path=output)
+            feedback_payload = json.loads(feedback_path.read_text(encoding="utf-8"))
+            self.assertEqual(feedback_payload["column_requests"], [])
+            self.assertEqual(
+                feedback_payload["judgement"]["missing_field_requests"][0]["field_name"],
+                "security_evidence_type",
+            )
+
+    def test_heuristic_planner_uses_feedback_refined_fields(self) -> None:
+        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        source_sql = workspace / "call_records.sql"
+        feedback_payload = {
+            "query": "Which calls mention founder-led sales calls?",
+            "column_requests": [
+                {
+                    "action": "add_field",
+                    "field_name": "founder_led_sales",
+                    "field_type": "list",
+                    "description": "Reusable silver signal for founder-led sales calls.",
+                    "reason": "No current silver field represented this concept.",
+                    "priority": "high",
+                    "suggested_allowed_values": ["founder", "led", "sales"],
+                    "example_queries": ["Which calls mention founder-led sales calls?"],
+                    "evidence_refs": ["chunk:call-005:chunk-001"],
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            feedback_path = Path(tmp) / "feedback.jsonl"
+            feedback_path.write_text(json.dumps(feedback_payload) + "\n", encoding="utf-8")
+            output = Path(tmp) / "corpus"
+            run_content_understanding(
+                sample,
+                output,
+                source_sql=source_sql,
+                schema_inducer=StaticSchemaInducer(),
+                feedback_input=feedback_path,
+            )
+            agent = QueryUnderstandingAgent(SilverCorpus.from_dir(output))
+
+            result = agent.answer("Which calls mention founder-led sales calls?")
+
+            self.assertEqual(result["plan"]["operation"], "filter")
+            self.assertEqual(result["plan"]["filters"], {"founder_led_sales": "founder"})
+            self.assertEqual(result["records"][0]["call_id"], "call-005")
+
+    def test_bm25_index_handles_corpus_with_no_search_tokens(self) -> None:
+        index = BM25Index(
+            [
+                {
+                    "chunk_id": "chunk-001",
+                    "call_id": "call-001",
+                    "bm25_text": "the and call",
+                    "embedding_text": "",
+                }
+            ]
+        )
+
+        self.assertEqual(index.search("the call", allowed_call_ids=None, limit=1), [])
+
+    def test_bm25_index_returns_match_details(self) -> None:
+        index = BM25Index(
+            [
+                {
+                    "chunk_id": "chunk-001",
+                    "call_id": "call-001",
+                    "bm25_text": "founder led sales calls",
+                    "embedding_text": "",
+                }
+            ]
+        )
+
+        results = index.search("founder sales", allowed_call_ids=None, limit=1)
+
+        self.assertEqual(results[0]["matched_terms"], ["founder", "sales"])
+        self.assertEqual(results[0]["query_terms"], ["founder", "sales"])
+        self.assertIn("score_details", results[0])
+
+
+    def test_cli_loads_openai_env_file_without_printing_secret_defaults(self) -> None:
+        keys = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL")
+        previous = {key: os.environ.get(key) for key in keys}
+        for key in keys:
+            os.environ.pop(key, None)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                env_file = Path(tmp) / ".env"
+                env_file.write_text(
+                    "OPENAI_API_KEY=sk-test-secret\nOPENAI_BASE_URL=https://example.test/v1\n",
+                    encoding="utf-8",
+                )
+
+                args = parse_args(["--env-file", str(env_file)])
+
+                self.assertEqual(args.llm_api_key, "sk-test-secret")
+                self.assertEqual(args.llm_base_url, "https://example.test/v1")
+                self.assertEqual(args.llm_model, DEFAULT_OPENAI_MODEL)
+                self.assertEqual(args.judge_api_key, "sk-test-secret")
+                self.assertEqual(args.judge_base_url, "https://example.test/v1")
+                self.assertIsNone(args.judge_model)
+
+                routed = parse_args(
+                    [
+                        "--env-file",
+                        str(env_file),
+                        "--judge-model",
+                        "gpt-5.4",
+                        "--judge-base-url",
+                        "https://judge.example.test/v1",
+                    ]
+                )
+                self.assertEqual(routed.judge_model, "gpt-5.4")
+                self.assertEqual(routed.judge_base_url, "https://judge.example.test/v1")
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_cli_rejects_removed_non_llm_modes(self) -> None:
+        for args in (
+            ["--planner", "heuristic"],
+            ["--planner", "auto"],
+            ["--judge", "heuristic"],
+            ["--judge", "auto"],
+            ["--judge", "none"],
+            ["--retrieval-subagent", "auto"],
+            ["--reranker", "auto"],
+            ["--search-controller", "auto"],
+        ):
+            with self.subTest(args=args), self.assertRaises(SystemExit):
+                parse_args(args)
+
+    def test_llm_downstream_query_generator_records_provenance(self) -> None:
+        catalog = {
+            "schema_version": "test",
+            "fields": [
+                {
+                    "name": "product_area",
+                    "type": "enum",
+                    "description": "Product area discussed in the call.",
+                    "allowed_values": ["crm"],
+                    "search": {"filterable": True, "aggregatable": True},
+                }
+            ],
+        }
+        adjusted_for = adjusted_for_cu_schema(
+            loop_id="loop-test",
+            iteration=0,
+            cu_output=Path("/tmp/cu"),
+            catalog=catalog,
+            manifest={"record_count": 2, "chunk_count": 3},
+        )
+        generator = LLMDownstreamQueryGenerator(
+            FakeJSONClient(
+                {
+                    "tasks": [
+                        {
+                            "query": "Count calls by product area.",
+                            "intent": "aggregate",
+                            "expected_operation": "aggregate",
+                            "targets_schema_gaps": ["product_area"],
+                            "rationale": "Aggregation probe.",
+                        }
+                    ],
+                    "coverage_notes": "One aggregate probe.",
+                }
+            )
+        )
+
+        tasks, report = generator.generate(
+            catalog=catalog,
+            manifest={"record_count": 2, "chunk_count": 3},
+            existing_tasks=[],
+            adjusted_for=adjusted_for,
+            max_tasks=3,
+        )
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["source_type"], "synthetic_llm")
+        self.assertEqual(tasks[0]["label_status"], "unlabeled")
+        self.assertEqual(tasks[0]["adjusted_for"]["schema_hash"], adjusted_for["schema_hash"])
+        self.assertEqual(tasks[0]["provenance"]["prompt"]["prompt_id"], "qu.downstream_query_bootstrap")
+        self.assertEqual(report.generated_count, 1)
+
+    def test_heuristic_bootstrap_tasks_are_dedupable(self) -> None:
+        catalog = {
+            "schema_version": "test",
+            "fields": [
+                {
+                    "name": "product_area",
+                    "type": "enum",
+                    "allowed_values": ["crm"],
+                    "search": {"filterable": True, "aggregatable": True},
+                }
+            ],
+        }
+        adjusted_for = adjusted_for_cu_schema(
+            loop_id="loop-test",
+            iteration=0,
+            cu_output=Path("/tmp/cu"),
+            catalog=catalog,
+            manifest={"record_count": 2, "chunk_count": 3},
+        )
+
+        tasks, report = build_heuristic_bootstrap_tasks(
+            catalog=catalog,
+            adjusted_for=adjusted_for,
+            max_tasks=4,
+        )
+
+        self.assertTrue(tasks)
+        self.assertEqual(report.generator, "heuristic")
+        self.assertEqual(len(dedupe_query_tasks([tasks[0], tasks[0]])), 1)
+        self.assertEqual(tasks[0]["adjusted_for"]["purpose"], "bootstrap downstream query distribution for CU-QU feedback")
+
+
+class StaticPlanner:
+    name = "static"
+
+    def plan(self, query, catalog):
+        return QueryPlan(
+            operation="filter",
+            filters={"security_review_requested": True},
+            ranking_query=query,
+            planner=self.name,
+            reasoning="Test planner injection.",
+        )
+
+
+class EmbeddingSearchPlanner:
+    name = "embedding-static"
+
+    def plan(self, query, catalog):
+        return QueryPlan(
+            operation="search",
+            ranking_query="founder led conversations",
+            planner=self.name,
+            reasoning="Test embedding retrieval tool.",
+            steps=[
+                QueryToolStep(
+                    tool="embedding_search_chunks",
+                    arguments={"query": "founder led conversations", "limit": 1, "promote_records": True},
+                    purpose="Exercise embedding retrieval.",
+                ),
+                QueryToolStep(tool="fetch_chunks", arguments={"limit": 1}, purpose="Fetch evidence."),
+            ],
+        )
+
+
+class FakeEmbeddingClient:
+    model = "fake-embedding"
+
+    def embed_texts(self, texts):
+        embeddings = []
+        for text in texts:
+            normalized = text.lower().replace("-", " ")
+            embeddings.append([1.0, 0.0] if "founder led" in normalized else [0.0, 1.0])
+        return embeddings
+
+
+class Sid1StyleRetrievalSubAgent:
+    name = "sid1-fixture"
+
+    def __init__(self):
+        self.called = False
+
+    def after_search_step(
+        self,
+        *,
+        query,
+        plan,
+        state,
+        limit,
+        trace,
+        execute_step,
+        available_tools,
+        trace_tool_name,
+    ):
+        del available_tools, trace_tool_name
+        if self.called:
+            return
+        self.called = True
+        execute_step(
+            QueryToolStep(
+                tool="embedding_search_chunks",
+                arguments={"query": "founder led conversations", "limit": 1, "promote_records": True},
+                purpose="SID-1 fixture semantic recall branch.",
+            ),
+            query=query,
+            plan=plan,
+            state=state,
+            limit=limit,
+            trace=trace,
+        )
+
+    def finalize(self, *, query, plan, state, limit, trace):
+        del query, plan, state, limit
+        trace.append(
+            ToolEvent(
+                step=len(trace) + 1,
+                tool="retrieval_subagent:sid1-fixture",
+                arguments={"mode": "fixture"},
+                result_summary="Executed specialized retrieval subagent fixture.",
+            )
+        )
+
+
+class FakeJSONClient:
+    provider_name = "fake-llm"
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def complete_json(self, *, system, user):
+        self.system = system
+        self.user = user
+        return self.payload
+
+
+class FakeSequenceJSONClient:
+    def __init__(self, payloads, provider_name="fake-llm"):
+        self.payloads = list(payloads)
+        self.provider_name = provider_name
+        self.calls = []
+
+    def complete_json(self, *, system, user):
+        self.calls.append({"system": system, "user": user})
+        if not self.payloads:
+            return {"action": "stop"}
+        return self.payloads.pop(0)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,17 @@
+[project]
+name = "cu-agent-rlm"
+version = "0.1.0"
+description = "RLM-style content-understanding prototype for Databricks call_records."
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+cu-agent-rlm = "cu_agent_rlm.cli:main"
+

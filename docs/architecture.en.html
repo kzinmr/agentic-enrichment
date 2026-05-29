@@ -1,0 +1,1029 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent-Native RLM Architecture — cu-agent-rlm × qu-agent-rlm</title>
+<style>
+  :root {
+    --bg: #fbfaf7;
+    --bg-panel: #ffffff;
+    --bg-panel-alt: #f5f3ee;
+    --ink: #15181c;
+    --ink-soft: #4a4f57;
+    --ink-faint: #80858d;
+    --rule: #e6e2d8;
+    --rule-soft: #efece4;
+    --cu: #2b4c5b;
+    --cu-soft: #e6eef1;
+    --qu: #8b5a2b;
+    --qu-soft: #f3e8db;
+    --gate-active: #2d6a4f;
+    --gate-blocked: #b3261e;
+    --gate-pending: #a26200;
+    --accent: #1f3a5f;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 56px 32px 96px; }
+  header.hero { border-bottom: 1px solid var(--rule); padding-bottom: 36px; margin-bottom: 56px; }
+  header.hero .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-bottom: 18px;
+  }
+  header.hero h1 {
+    font-size: 38px;
+    line-height: 1.15;
+    margin: 0 0 14px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  header.hero .lede {
+    font-size: 17px;
+    color: var(--ink-soft);
+    max-width: 720px;
+    margin: 0;
+  }
+  header.hero .meta {
+    display: flex;
+    gap: 28px;
+    margin-top: 24px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-faint);
+  }
+  header.hero .meta span { display: inline-flex; gap: 6px; }
+  header.hero .meta span b { color: var(--ink-soft); font-weight: 500; }
+
+  section { margin: 0 0 72px; }
+  section h2 {
+    font-size: 13px;
+    font-family: var(--mono);
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0 0 8px;
+    font-weight: 500;
+  }
+  section h3.title {
+    font-size: 26px;
+    margin: 0 0 8px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+  }
+  section .deck {
+    font-size: 15px;
+    color: var(--ink-soft);
+    margin: 0 0 32px;
+    max-width: 760px;
+  }
+
+  /* Three Pillars */
+  .pillars { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 18px; }
+  .pillar {
+    border: 1px solid var(--rule);
+    background: var(--bg-panel);
+    border-radius: 6px;
+    padding: 22px 22px 24px;
+    display: flex;
+    flex-direction: column;
+  }
+  .pillar header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 14px; }
+  .pillar h4 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+  }
+  .pillar .chip {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 99px;
+    border: 1px solid currentColor;
+  }
+  .chip.active { color: var(--gate-active); }
+  .chip.blocked { color: var(--gate-blocked); }
+  .chip.pending { color: var(--gate-pending); }
+  .pillar dl { margin: 0; display: grid; grid-template-columns: 110px 1fr; gap: 6px 14px; font-size: 13px; }
+  .pillar dt { color: var(--ink-faint); font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; padding-top: 3px; }
+  .pillar dd { margin: 0; color: var(--ink); }
+  .pillar dd code { font-family: var(--mono); font-size: 12px; background: var(--bg-panel-alt); padding: 1px 5px; border-radius: 3px; color: var(--ink-soft); }
+  .pillar footer { margin-top: auto; padding-top: 18px; color: var(--ink-soft); font-size: 13px; border-top: 1px dashed var(--rule); margin-top: 22px; }
+  .pillar footer .label { display: block; font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 5px; }
+
+  /* Diagrams */
+  .diagram { border: 1px solid var(--rule); border-radius: 6px; background: var(--bg-panel); padding: 28px; overflow-x: auto; }
+  svg { display: block; max-width: 100%; height: auto; }
+  svg text { font-family: var(--sans); fill: var(--ink); }
+  svg .label-mono { font-family: var(--mono); font-size: 11px; fill: var(--ink-soft); }
+  svg .label-eyebrow { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; fill: var(--ink-faint); }
+  svg .node-title { font-size: 13px; font-weight: 600; }
+  svg .node-sub { font-size: 11px; fill: var(--ink-soft); font-family: var(--mono); }
+
+  /* Tool ring */
+  .tool-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .tool-card {
+    border: 1px solid var(--rule);
+    background: var(--bg-panel);
+    border-radius: 6px;
+    padding: 18px 20px;
+  }
+  .tool-card h5 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+  .tool-card .sub { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); margin-bottom: 12px; }
+  .tool-card ul { margin: 0; padding-left: 18px; font-size: 13px; color: var(--ink-soft); }
+  .tool-card ul li { margin: 4px 0; }
+  .tool-card ul li code { font-family: var(--mono); font-size: 12px; color: var(--ink); background: var(--bg-panel-alt); padding: 1px 5px; border-radius: 3px; }
+  .tool-card.cu { border-top: 3px solid var(--cu); }
+  .tool-card.qu { border-top: 3px solid var(--qu); }
+  .tool-card.shared { border-top: 3px solid var(--ink-faint); }
+
+  /* Tables */
+  table.matrix {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--bg-panel);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow: hidden;
+    font-size: 13px;
+  }
+  table.matrix thead { background: var(--bg-panel-alt); }
+  table.matrix th, table.matrix td { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  table.matrix tbody tr:last-child td { border-bottom: none; }
+  table.matrix th { font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); font-weight: 500; }
+  table.matrix td code { font-family: var(--mono); font-size: 12px; background: var(--bg-panel-alt); padding: 1px 5px; border-radius: 3px; }
+  table.matrix .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; vertical-align: 1px; }
+  .dot.active { background: var(--gate-active); }
+  .dot.blocked { background: var(--gate-blocked); }
+  .dot.pending { background: var(--gate-pending); }
+
+  /* Artifact list */
+  .artifact-list {
+    border: 1px solid var(--rule);
+    background: var(--bg-panel);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .artifact-list .row { display: grid; grid-template-columns: 270px 110px 1fr; gap: 20px; padding: 14px 20px; border-bottom: 1px solid var(--rule-soft); align-items: baseline; font-size: 13px; }
+  .artifact-list .row:last-child { border-bottom: none; }
+  .artifact-list .row code { font-family: var(--mono); font-size: 12px; color: var(--ink); }
+  .artifact-list .row .kind { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); }
+  .artifact-list .row .desc { color: var(--ink-soft); }
+
+  /* Loop figure */
+  .loop-figure { position: relative; }
+
+  /* Issue grid */
+  .issue-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .issue {
+    border: 1px solid var(--rule);
+    background: var(--bg-panel);
+    border-radius: 4px;
+    padding: 12px 14px;
+    font-size: 13px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .issue .id { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); letter-spacing: 0.06em; }
+  .issue .label { line-height: 1.35; }
+  .issue .status {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-top: 6px;
+    align-self: flex-start;
+    padding: 2px 7px;
+    border-radius: 99px;
+    border: 1px solid currentColor;
+  }
+  .status.done { color: var(--gate-active); }
+  .status.partial { color: var(--gate-pending); }
+  .status.open { color: var(--ink-faint); }
+  .status.blocked { color: var(--gate-blocked); }
+  .status.design { color: var(--accent); }
+
+  /* Legend */
+  .legend { display: flex; gap: 20px; font-size: 12px; color: var(--ink-soft); margin-top: 14px; flex-wrap: wrap; }
+  .legend .item { display: inline-flex; align-items: center; gap: 7px; }
+  .legend .swatch { display: inline-block; width: 14px; height: 14px; border-radius: 2px; border: 1px solid var(--rule); }
+  .swatch.cu { background: var(--cu-soft); border-color: var(--cu); }
+  .swatch.qu { background: var(--qu-soft); border-color: var(--qu); }
+  .swatch.gate { background: #fbe8e6; border-color: var(--gate-blocked); }
+  .swatch.signal { background: var(--bg-panel-alt); border-color: var(--ink-faint); }
+
+  /* Footer */
+  footer.foot { margin-top: 64px; padding-top: 28px; border-top: 1px solid var(--rule); font-size: 12px; color: var(--ink-faint); font-family: var(--mono); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+
+  @media (max-width: 880px) {
+    .wrap { padding: 32px 20px 64px; }
+    header.hero h1 { font-size: 28px; }
+    .pillars { grid-template-columns: 1fr; }
+    .tool-grid { grid-template-columns: 1fr; }
+    .issue-grid { grid-template-columns: repeat(2, 1fr); }
+    .artifact-list .row { grid-template-columns: 1fr; gap: 6px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow">Architecture Overview</div>
+  <h1>Agent-Native RLM Architecture</h1>
+  <p class="lede">
+    A bird's-eye view of the self-improving loop formed by
+    <code style="font-family:var(--mono);background:var(--bg-panel-alt);padding:1px 5px;border-radius:3px">cu-agent-rlm</code>
+    and
+    <code style="font-family:var(--mono);background:var(--bg-panel-alt);padding:1px 5px;border-radius:3px">qu-agent-rlm</code>.
+    The diagrams show how the catalog / prompts / queries pillars evolve as first-class state, while a strict tool boundary
+    keeps raw transcripts out of every LLM prompt.
+  </p>
+  <div class="meta">
+    <span>schema_version <b>silver.rlm.v1</b></span>
+    <span>prompt baseline <b>2026-05-29.1</b></span>
+    <span>last updated <b>2026-05-30</b></span>
+  </div>
+</header>
+
+<!-- ============================================== -->
+<!-- SECTION 1 : Three Pillars                       -->
+<!-- ============================================== -->
+<section>
+  <h2>01 — Three Pillars</h2>
+  <h3 class="title">First-class state</h3>
+  <p class="deck">
+    The system has exactly three mutable kinds of state. Each carries an <b>identity</b> (versioned name),
+    <b>storage</b>, a <b>proposal channel</b>, and a <b>promotion gate</b> — all sharing the same lifecycle.
+  </p>
+
+  <div class="pillars">
+
+    <div class="pillar">
+      <header>
+        <h4>Catalog</h4>
+        <span class="chip active">Active</span>
+      </header>
+      <dl>
+        <dt>identity</dt><dd><code>field_name + schema_version</code></dd>
+        <dt>storage</dt><dd><code>silver_schema_catalog.json</code></dd>
+        <dt>proposal</dt><dd><code>column_requests.jsonl</code></dd>
+        <dt>gate</dt><dd><code>evidence_coverage ≥ 0.75</code></dd>
+        <dt>provenance</dt><dd>manifest.schema_induction.inducer = <code>"openai+feedback"</code></dd>
+      </dl>
+      <footer>
+        <span class="label">Auto-promotion live</span>
+        QU emits column_requests; CU extends the schema and only fields that pass support + evidence_coverage land in silver.
+      </footer>
+    </div>
+
+    <div class="pillar">
+      <header>
+        <h4>Prompts</h4>
+        <span class="chip blocked">Blocked on EVAL-001</span>
+      </header>
+      <dl>
+        <dt>identity</dt><dd><code>prompt_id + version</code></dd>
+        <dt>storage</dt><dd><code>prompt_registry.py</code> (<code>frozen=True</code>)</dd>
+        <dt>proposal</dt><dd><code>prompt_repair_request.jsonl</code></dd>
+        <dt>gate</dt><dd><code>external_hand_labeled_eval_required</code></dd>
+        <dt>provenance</dt><dd>Every LLM call recorded under result.prompt_state.*</dd>
+      </dl>
+      <footer>
+        <span class="label">Signal-only / auto-promotion frozen</span>
+        <code>action: "collect_signal_only"</code> is baked into the data; mutation is structurally forbidden until EVAL-001 is resolved.
+      </footer>
+    </div>
+
+    <div class="pillar">
+      <header>
+        <h4>Queries</h4>
+        <span class="chip pending">Unlabeled bootstrap</span>
+      </header>
+      <dl>
+        <dt>identity</dt><dd><code>task_id + generation_id</code></dd>
+        <dt>storage</dt><dd><code>query_tasks.jsonl</code></dd>
+        <dt>proposal</dt><dd><code>query_bootstrap.json</code> / production log</dd>
+        <dt>gate</dt><dd><code>label_status: hand_labeled</code> required</dd>
+        <dt>provenance</dt><dd><code>adjusted_for.schema_hash</code> snapshots the CU state at generation time</dd>
+      </dl>
+      <footer>
+        <span class="label">Exploration OK / promotion forbidden</span>
+        <code>synthetic_llm</code> can be replayed inside the loop, but never drives prompt or schema decisions.
+      </footer>
+    </div>
+
+  </div>
+</section>
+
+<!-- ============================================== -->
+<!-- SECTION 2 : End-to-end Data Flow                -->
+<!-- ============================================== -->
+<section>
+  <h2>02 — End-to-end Data Flow</h2>
+  <h3 class="title">CU → QU → Feedback → CU'</h3>
+  <p class="deck">
+    One loop = seven phases. <code style="font-family:var(--mono);font-size:13px">scripts/qu_cu_loop_demo.py</code>
+    writes every event with loop_id + iteration + phase into orchestration_trace.jsonl.
+  </p>
+
+  <div class="diagram loop-figure">
+    <svg viewBox="0 0 1120 540" role="img" aria-label="CU-QU outer loop">
+      <!-- Defs -->
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#4a4f57"/>
+        </marker>
+        <marker id="arr-cu" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#2b4c5b"/>
+        </marker>
+        <marker id="arr-qu" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b5a2b"/>
+        </marker>
+        <marker id="arr-feedback" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#b3261e"/>
+        </marker>
+      </defs>
+
+      <!-- Lane labels -->
+      <text x="20" y="42" class="label-eyebrow">cu lane</text>
+      <text x="20" y="246" class="label-eyebrow">shared substrate</text>
+      <text x="20" y="392" class="label-eyebrow">qu lane</text>
+
+      <!-- Top inputs row -->
+      <g>
+        <rect x="60" y="58" width="160" height="48" rx="4" fill="#fff" stroke="#2b4c5b" stroke-width="1.2"/>
+        <text x="140" y="80" text-anchor="middle" class="node-title">call_records</text>
+        <text x="140" y="96" text-anchor="middle" class="node-sub">.sql / .jsonl</text>
+      </g>
+
+      <!-- CU stages -->
+      <g>
+        <rect x="250" y="58" width="120" height="48" rx="4" fill="#e6eef1" stroke="#2b4c5b" stroke-width="1.2"/>
+        <text x="310" y="80" text-anchor="middle" class="node-title">chunk</text>
+        <text x="310" y="96" text-anchor="middle" class="node-sub">max_chars=900</text>
+      </g>
+      <g>
+        <rect x="400" y="58" width="160" height="48" rx="4" fill="#e6eef1" stroke="#2b4c5b" stroke-width="1.2"/>
+        <text x="480" y="80" text-anchor="middle" class="node-title">induce_schema</text>
+        <text x="480" y="96" text-anchor="middle" class="node-sub">LLM + feedback</text>
+      </g>
+      <g>
+        <rect x="590" y="58" width="160" height="48" rx="4" fill="#e6eef1" stroke="#2b4c5b" stroke-width="1.2"/>
+        <text x="670" y="80" text-anchor="middle" class="node-title">extract</text>
+        <text x="670" y="96" text-anchor="middle" class="node-sub">per-call sub-rlm + validator</text>
+      </g>
+      <g>
+        <rect x="780" y="58" width="140" height="48" rx="4" fill="#fbe8e6" stroke="#b3261e" stroke-width="1.2"/>
+        <text x="850" y="80" text-anchor="middle" class="node-title">quality gate</text>
+        <text x="850" y="96" text-anchor="middle" class="node-sub">evidence_cov ≥ 0.75</text>
+      </g>
+      <g>
+        <rect x="950" y="58" width="140" height="48" rx="4" fill="#e6eef1" stroke="#2b4c5b" stroke-width="1.2"/>
+        <text x="1020" y="80" text-anchor="middle" class="node-title">materialize</text>
+        <text x="1020" y="96" text-anchor="middle" class="node-sub">silver_calls + catalog</text>
+      </g>
+
+      <!-- CU arrows -->
+      <path d="M 220 82 L 250 82" stroke="#2b4c5b" stroke-width="1.4" fill="none" marker-end="url(#arr-cu)"/>
+      <path d="M 370 82 L 400 82" stroke="#2b4c5b" stroke-width="1.4" fill="none" marker-end="url(#arr-cu)"/>
+      <path d="M 560 82 L 590 82" stroke="#2b4c5b" stroke-width="1.4" fill="none" marker-end="url(#arr-cu)"/>
+      <path d="M 750 82 L 780 82" stroke="#2b4c5b" stroke-width="1.4" fill="none" marker-end="url(#arr-cu)"/>
+      <path d="M 920 82 L 950 82" stroke="#2b4c5b" stroke-width="1.4" fill="none" marker-end="url(#arr-cu)"/>
+
+      <!-- Substrate (middle band) -->
+      <g>
+        <rect x="60" y="200" width="1030" height="98" rx="4" fill="#fafaf6" stroke="#e6e2d8" stroke-width="1"/>
+      </g>
+      <g>
+        <rect x="80" y="220" width="180" height="58" rx="4" fill="#fff" stroke="#80858d" stroke-width="1"/>
+        <text x="170" y="244" text-anchor="middle" class="node-title">manifest.json</text>
+        <text x="170" y="262" text-anchor="middle" class="node-sub">+ schema_induction</text>
+        <text x="170" y="274" text-anchor="middle" class="node-sub">+ prompt_state</text>
+      </g>
+      <g>
+        <rect x="280" y="220" width="180" height="58" rx="4" fill="#fff" stroke="#80858d" stroke-width="1"/>
+        <text x="370" y="244" text-anchor="middle" class="node-title">silver_schema_catalog</text>
+        <text x="370" y="262" text-anchor="middle" class="node-sub">fields + allowed_values</text>
+        <text x="370" y="274" text-anchor="middle" class="node-sub">filterable/aggregatable</text>
+      </g>
+      <g>
+        <rect x="480" y="220" width="180" height="58" rx="4" fill="#fff" stroke="#80858d" stroke-width="1"/>
+        <text x="570" y="244" text-anchor="middle" class="node-title">silver_calls.jsonl</text>
+        <text x="570" y="262" text-anchor="middle" class="node-sub">fields + evidence_refs</text>
+        <text x="570" y="274" text-anchor="middle" class="node-sub">+ quality_flags</text>
+      </g>
+      <g>
+        <rect x="680" y="220" width="160" height="58" rx="4" fill="#fff" stroke="#80858d" stroke-width="1"/>
+        <text x="760" y="244" text-anchor="middle" class="node-title">chunks.jsonl</text>
+        <text x="760" y="262" text-anchor="middle" class="node-sub">chunk_id, text</text>
+        <text x="760" y="274" text-anchor="middle" class="node-sub">snippet (≤220)</text>
+      </g>
+      <g>
+        <rect x="860" y="220" width="200" height="58" rx="4" fill="#fff" stroke="#80858d" stroke-width="1"/>
+        <text x="960" y="244" text-anchor="middle" class="node-title">feedback_report.json</text>
+        <text x="960" y="262" text-anchor="middle" class="node-sub">accepted_into_schema</text>
+        <text x="960" y="274" text-anchor="middle" class="node-sub">promoted_to_silver</text>
+      </g>
+
+      <!-- CU → Substrate arrows -->
+      <path d="M 1020 110 Q 1020 160 960 218" stroke="#2b4c5b" stroke-width="1.2" fill="none" stroke-dasharray="4 3" marker-end="url(#arr-cu)"/>
+      <path d="M 850 110 Q 850 160 760 218" stroke="#2b4c5b" stroke-width="1.2" fill="none" stroke-dasharray="4 3" marker-end="url(#arr-cu)"/>
+      <path d="M 670 110 Q 670 160 570 218" stroke="#2b4c5b" stroke-width="1.2" fill="none" stroke-dasharray="4 3" marker-end="url(#arr-cu)"/>
+      <path d="M 480 110 Q 480 160 370 218" stroke="#2b4c5b" stroke-width="1.2" fill="none" stroke-dasharray="4 3" marker-end="url(#arr-cu)"/>
+      <path d="M 140 110 Q 140 160 170 218" stroke="#2b4c5b" stroke-width="1.2" fill="none" stroke-dasharray="4 3" marker-end="url(#arr-cu)"/>
+
+      <!-- QU stages -->
+      <g>
+        <rect x="60" y="410" width="160" height="48" rx="4" fill="#f3e8db" stroke="#8b5a2b" stroke-width="1.2"/>
+        <text x="140" y="432" text-anchor="middle" class="node-title">load_schema</text>
+        <text x="140" y="448" text-anchor="middle" class="node-sub">+ query_tasks</text>
+      </g>
+      <g>
+        <rect x="250" y="410" width="120" height="48" rx="4" fill="#f3e8db" stroke="#8b5a2b" stroke-width="1.2"/>
+        <text x="310" y="432" text-anchor="middle" class="node-title">plan_query</text>
+        <text x="310" y="448" text-anchor="middle" class="node-sub">LLM-first</text>
+      </g>
+      <g>
+        <rect x="400" y="410" width="160" height="48" rx="4" fill="#f3e8db" stroke="#8b5a2b" stroke-width="1.2"/>
+        <text x="480" y="432" text-anchor="middle" class="node-title">multi-step exec</text>
+        <text x="480" y="448" text-anchor="middle" class="node-sub">BM25 / embed / silver</text>
+      </g>
+      <g>
+        <rect x="590" y="410" width="160" height="48" rx="4" fill="#f3e8db" stroke="#8b5a2b" stroke-width="1.2"/>
+        <text x="670" y="432" text-anchor="middle" class="node-title">retrieval subagent</text>
+        <text x="670" y="448" text-anchor="middle" class="node-sub">diversity + rerank</text>
+      </g>
+      <g>
+        <rect x="780" y="410" width="140" height="48" rx="4" fill="#f3e8db" stroke="#8b5a2b" stroke-width="1.2"/>
+        <text x="850" y="432" text-anchor="middle" class="node-title">judge</text>
+        <text x="850" y="448" text-anchor="middle" class="node-sub">answerability + evidence</text>
+      </g>
+      <g>
+        <rect x="950" y="410" width="140" height="48" rx="4" fill="#fff" stroke="#8b5a2b" stroke-width="1.2"/>
+        <text x="1020" y="432" text-anchor="middle" class="node-title">answer.json</text>
+        <text x="1020" y="448" text-anchor="middle" class="node-sub">+ judgement</text>
+      </g>
+
+      <!-- QU arrows -->
+      <path d="M 220 434 L 250 434" stroke="#8b5a2b" stroke-width="1.4" fill="none" marker-end="url(#arr-qu)"/>
+      <path d="M 370 434 L 400 434" stroke="#8b5a2b" stroke-width="1.4" fill="none" marker-end="url(#arr-qu)"/>
+      <path d="M 560 434 L 590 434" stroke="#8b5a2b" stroke-width="1.4" fill="none" marker-end="url(#arr-qu)"/>
+      <path d="M 750 434 L 780 434" stroke="#8b5a2b" stroke-width="1.4" fill="none" marker-end="url(#arr-qu)"/>
+      <path d="M 920 434 L 950 434" stroke="#8b5a2b" stroke-width="1.4" fill="none" marker-end="url(#arr-qu)"/>
+
+      <!-- Substrate → QU arrows (catalog/silver/chunks supply QU) -->
+      <path d="M 370 280 Q 370 350 310 408" stroke="#80858d" stroke-width="1.2" fill="none" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+      <path d="M 570 280 Q 570 350 480 408" stroke="#80858d" stroke-width="1.2" fill="none" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+      <path d="M 760 280 Q 760 350 670 408" stroke="#80858d" stroke-width="1.2" fill="none" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+
+      <!-- Feedback loop : QU answer back to CU induce_schema -->
+      <path d="M 1020 462 Q 1100 510 1100 280 Q 1100 30 480 30 Q 410 30 405 56"
+            stroke="#b3261e" stroke-width="1.6" fill="none" marker-end="url(#arr-feedback)"/>
+      <g>
+        <rect x="780" y="500" width="220" height="28" rx="4" fill="#fff" stroke="#b3261e" stroke-width="1"/>
+        <text x="890" y="519" text-anchor="middle" class="node-sub" style="fill:#b3261e">column_requests + judgement + prompt_repair</text>
+      </g>
+
+      <!-- iteration ticker -->
+      <text x="20" y="20" class="label-eyebrow">iteration 0 → 1 (single loop = 7 phases)</text>
+    </svg>
+    <div class="legend">
+      <span class="item"><span class="swatch cu"></span> CU lane (cu-agent-rlm)</span>
+      <span class="item"><span class="swatch qu"></span> QU lane (qu-agent-rlm)</span>
+      <span class="item"><span class="swatch signal"></span> shared substrate (artifacts)</span>
+      <span class="item"><span class="swatch gate"></span> promotion gate</span>
+      <span class="item" style="color:var(--gate-blocked)">— — — feedback channel</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================== -->
+<!-- SECTION 3 : Tool Boundary                       -->
+<!-- ============================================== -->
+<section>
+  <h2>03 — Tool Boundary</h2>
+  <h3 class="title">7 step tools + 5 base tools</h3>
+  <p class="deck">
+    The LLM can only touch a fixed set of tools. <code style="font-family:var(--mono);font-size:13px">call_records</code>
+    itself never enters a prompt; every reference is mediated by <code>chunk:&lt;id&gt;</code>.
+  </p>
+
+  <div class="diagram" style="padding: 24px">
+    <svg viewBox="0 0 1080 360" role="img" aria-label="Tool boundary">
+      <defs>
+        <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#80858d"/>
+        </marker>
+      </defs>
+
+      <!-- Center: data substrate -->
+      <g>
+        <rect x="380" y="120" width="320" height="120" rx="6" fill="#fafaf6" stroke="#80858d" stroke-width="1.2"/>
+        <text x="540" y="148" text-anchor="middle" class="node-title">silver substrate</text>
+        <text x="540" y="172" text-anchor="middle" class="node-sub">catalog · silver_calls · chunks</text>
+        <text x="540" y="190" text-anchor="middle" class="node-sub">manifest · evidence_refs</text>
+        <text x="540" y="220" text-anchor="middle" class="label-mono" style="fill:#b3261e">root agent never reads raw transcript</text>
+      </g>
+
+      <!-- Surrounding tools -->
+      <!-- Retrieval tools (left) -->
+      <g>
+        <rect x="40" y="50" width="180" height="46" rx="4" fill="#f3e8db" stroke="#8b5a2b" stroke-width="1"/>
+        <text x="130" y="71" text-anchor="middle" class="node-title">bm25_search_chunks</text>
+        <text x="130" y="86" text-anchor="middle" class="node-sub">lexical + IDF</text>
+      </g>
+      <g>
+        <rect x="40" y="115" width="180" height="46" rx="4" fill="#f3e8db" stroke="#8b5a2b" stroke-width="1"/>
+        <text x="130" y="136" text-anchor="middle" class="node-title">embedding_search_chunks</text>
+        <text x="130" y="151" text-anchor="middle" class="node-sub">text-embedding-3-small</text>
+      </g>
+      <g>
+        <rect x="40" y="180" width="180" height="46" rx="4" fill="#f3e8db" stroke="#8b5a2b" stroke-width="1"/>
+        <text x="130" y="201" text-anchor="middle" class="node-title">fetch_chunks</text>
+        <text x="130" y="216" text-anchor="middle" class="node-sub">evidence resolver</text>
+      </g>
+
+      <!-- Silver tools (right) -->
+      <g>
+        <rect x="860" y="50" width="180" height="46" rx="4" fill="#e6eef1" stroke="#2b4c5b" stroke-width="1"/>
+        <text x="950" y="71" text-anchor="middle" class="node-title">query_silver</text>
+        <text x="950" y="86" text-anchor="middle" class="node-sub">filter by fields</text>
+      </g>
+      <g>
+        <rect x="860" y="115" width="180" height="46" rx="4" fill="#e6eef1" stroke="#2b4c5b" stroke-width="1"/>
+        <text x="950" y="136" text-anchor="middle" class="node-title">aggregate_silver</text>
+        <text x="950" y="151" text-anchor="middle" class="node-sub">group_by + count</text>
+      </g>
+      <g>
+        <rect x="860" y="180" width="180" height="46" rx="4" fill="#e6eef1" stroke="#2b4c5b" stroke-width="1"/>
+        <text x="950" y="201" text-anchor="middle" class="node-title">run_sql</text>
+        <text x="950" y="216" text-anchor="middle" class="node-sub">contract only · prod</text>
+      </g>
+
+      <!-- Meta tool (bottom) -->
+      <g>
+        <rect x="450" y="290" width="180" height="46" rx="4" fill="#fff" stroke="#a26200" stroke-width="1.2"/>
+        <text x="540" y="311" text-anchor="middle" class="node-title">review_schema_gaps</text>
+        <text x="540" y="326" text-anchor="middle" class="node-sub">QU → CU meta channel</text>
+      </g>
+
+      <!-- Lines to substrate -->
+      <line x1="220" y1="73" x2="380" y2="150" stroke="#80858d" stroke-width="1" marker-end="url(#arr2)"/>
+      <line x1="220" y1="138" x2="380" y2="172" stroke="#80858d" stroke-width="1" marker-end="url(#arr2)"/>
+      <line x1="220" y1="203" x2="380" y2="195" stroke="#80858d" stroke-width="1" marker-end="url(#arr2)"/>
+      <line x1="700" y1="150" x2="860" y2="73" stroke="#80858d" stroke-width="1" marker-end="url(#arr2)"/>
+      <line x1="700" y1="172" x2="860" y2="138" stroke="#80858d" stroke-width="1" marker-end="url(#arr2)"/>
+      <line x1="700" y1="195" x2="860" y2="203" stroke="#80858d" stroke-width="1" marker-end="url(#arr2)"/>
+      <line x1="540" y1="240" x2="540" y2="290" stroke="#a26200" stroke-width="1.2" stroke-dasharray="4 3"/>
+
+      <!-- Labels -->
+      <text x="130" y="30" text-anchor="middle" class="label-eyebrow">retrieval tools</text>
+      <text x="950" y="30" text-anchor="middle" class="label-eyebrow">silver tools</text>
+      <text x="540" y="280" text-anchor="middle" class="label-eyebrow">QU meta tool</text>
+
+    </svg>
+  </div>
+
+  <div class="tool-grid" style="margin-top: 18px">
+    <div class="tool-card qu">
+      <h5>Retrieval — agent-callable</h5>
+      <p class="sub">QU planner picks the tool per intent</p>
+      <ul>
+        <li><code>bm25_search_chunks</code> — exact terms, names, IDs (bm25s + numpy)</li>
+        <li><code>embedding_search_chunks</code> — paraphrase, semantic recall</li>
+        <li><code>search_chunks</code> — abstract / mode-routed (lexical / bm25 / embedding / hybrid)</li>
+        <li><code>fetch_chunks</code> — evidence resolver (always called before a claim)</li>
+      </ul>
+    </div>
+    <div class="tool-card cu">
+      <h5>Silver — structured access</h5>
+      <p class="sub">Operate on values without touching raw transcripts</p>
+      <ul>
+        <li><code>query_silver</code> — filter by promoted fields</li>
+        <li><code>aggregate_silver</code> — group_by on aggregatable fields</li>
+        <li><code>run_sql</code> — Databricks SELECT (contract only)</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================== -->
+<!-- SECTION 4 : Promotion Gate Pattern              -->
+<!-- ============================================== -->
+<section>
+  <h2>04 — Promotion Gate Pattern</h2>
+  <h3 class="title">Proposal → gate → state</h3>
+  <p class="deck">
+    Catalog / prompts / queries all follow the same <b>proposal → gate → accepted state</b> pattern.
+    Having a gate is what draws the line between <b>"code"</b> and <b>"data"</b>.
+  </p>
+
+  <div class="diagram" style="padding: 28px">
+    <svg viewBox="0 0 1080 280" role="img" aria-label="Promotion gate pattern">
+      <defs>
+        <marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#4a4f57"/>
+        </marker>
+      </defs>
+
+      <!-- Catalog row -->
+      <g>
+        <text x="20" y="55" class="label-eyebrow">catalog</text>
+        <rect x="100" y="32" width="200" height="46" rx="4" fill="#fff" stroke="#80858d" stroke-width="1"/>
+        <text x="200" y="53" text-anchor="middle" class="node-title">column_requests.jsonl</text>
+        <text x="200" y="68" text-anchor="middle" class="node-sub">QU proposal</text>
+
+        <rect x="380" y="32" width="240" height="46" rx="4" fill="#fbe8e6" stroke="#b3261e" stroke-width="1.2"/>
+        <text x="500" y="53" text-anchor="middle" class="node-title">evidence_coverage ≥ 0.75</text>
+        <text x="500" y="68" text-anchor="middle" class="node-sub">auto gate</text>
+
+        <rect x="700" y="32" width="200" height="46" rx="4" fill="#e6eef1" stroke="#2b4c5b" stroke-width="1"/>
+        <text x="800" y="53" text-anchor="middle" class="node-title">silver_calls.fields[*]</text>
+        <text x="800" y="68" text-anchor="middle" class="node-sub">promoted state</text>
+
+        <line x1="300" y1="55" x2="380" y2="55" stroke="#4a4f57" marker-end="url(#arr3)"/>
+        <line x1="620" y1="55" x2="700" y2="55" stroke="#4a4f57" marker-end="url(#arr3)"/>
+
+        <text x="990" y="55" class="label-mono" style="fill:var(--gate-active)">✓ active</text>
+      </g>
+
+      <!-- Prompts row -->
+      <g>
+        <text x="20" y="148" class="label-eyebrow">prompts</text>
+        <rect x="100" y="125" width="200" height="46" rx="4" fill="#fff" stroke="#80858d" stroke-width="1"/>
+        <text x="200" y="146" text-anchor="middle" class="node-title">prompt_repair_request</text>
+        <text x="200" y="161" text-anchor="middle" class="node-sub">QU / CU signal-only</text>
+
+        <rect x="380" y="125" width="240" height="46" rx="4" fill="#fbe8e6" stroke="#b3261e" stroke-width="1.2"/>
+        <text x="500" y="146" text-anchor="middle" class="node-title">external_hand_labeled_eval</text>
+        <text x="500" y="161" text-anchor="middle" class="node-sub">EVAL-001 pending · auto-promote frozen</text>
+
+        <rect x="700" y="125" width="200" height="46" rx="4" fill="#f5f3ee" stroke="#a26200" stroke-width="1" stroke-dasharray="4 3"/>
+        <text x="800" y="146" text-anchor="middle" class="node-title">prompt_registry vN+1</text>
+        <text x="800" y="161" text-anchor="middle" class="node-sub">FB-002 blocked</text>
+
+        <line x1="300" y1="148" x2="380" y2="148" stroke="#4a4f57" marker-end="url(#arr3)"/>
+        <line x1="620" y1="148" x2="700" y2="148" stroke="#a26200" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arr3)"/>
+
+        <text x="990" y="148" class="label-mono" style="fill:var(--gate-blocked)">✕ blocked</text>
+      </g>
+
+      <!-- Queries row -->
+      <g>
+        <text x="20" y="241" class="label-eyebrow">queries</text>
+        <rect x="100" y="218" width="200" height="46" rx="4" fill="#fff" stroke="#80858d" stroke-width="1"/>
+        <text x="200" y="239" text-anchor="middle" class="node-title">query_bootstrap.json</text>
+        <text x="200" y="254" text-anchor="middle" class="node-sub">synthetic_llm + curated</text>
+
+        <rect x="380" y="218" width="240" height="46" rx="4" fill="#fbe8e6" stroke="#b3261e" stroke-width="1.2"/>
+        <text x="500" y="239" text-anchor="middle" class="node-title">label_status: hand_labeled</text>
+        <text x="500" y="254" text-anchor="middle" class="node-sub">external fixture required</text>
+
+        <rect x="700" y="218" width="200" height="46" rx="4" fill="#f5f3ee" stroke="#a26200" stroke-width="1" stroke-dasharray="4 3"/>
+        <text x="800" y="239" text-anchor="middle" class="node-title">eval set / promotion driver</text>
+        <text x="800" y="254" text-anchor="middle" class="node-sub">replay only (current)</text>
+
+        <line x1="300" y1="241" x2="380" y2="241" stroke="#4a4f57" marker-end="url(#arr3)"/>
+        <line x1="620" y1="241" x2="700" y2="241" stroke="#a26200" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arr3)"/>
+
+        <text x="990" y="241" class="label-mono" style="fill:var(--gate-pending)">○ unlabeled</text>
+      </g>
+    </svg>
+  </div>
+</section>
+
+<!-- ============================================== -->
+<!-- SECTION 5 : Component Matrix                    -->
+<!-- ============================================== -->
+<section>
+  <h2>05 — Component Matrix</h2>
+  <h3 class="title">LLM-first pluggable interface</h3>
+  <p class="deck">
+    Semantic components share the <code style="font-family:var(--mono);font-size:13px">JSONChatClient</code>
+    Protocol, and the CLI/demo expose only LLM backends as user-facing modes.
+    Heuristics are not substitute intelligences — they are reliability fallbacks and smoke-test helpers.
+  </p>
+
+  <table class="matrix">
+    <thead>
+      <tr>
+        <th>Component</th>
+        <th>Package</th>
+        <th>CLI flag</th>
+        <th>User-facing modes</th>
+        <th>Validator / Provenance</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Schema inducer</td>
+        <td>CU</td>
+        <td><code>--schema-inducer</code></td>
+        <td>openai / openai-compatible</td>
+        <td>RESERVED_FIELD_NAMES, snake_case, not_mentioned enforced</td>
+      </tr>
+      <tr>
+        <td>Field extractor</td>
+        <td>CU</td>
+        <td><code>--extractor</code></td>
+        <td>openai / openai-compatible</td>
+        <td>chunk_id whitelist, allowed_values, validation_errors</td>
+      </tr>
+      <tr>
+        <td>Query planner</td>
+        <td>QU</td>
+        <td><code>--planner</code></td>
+        <td>openai / openai-compatible</td>
+        <td>catalog integrity, validate_steps, fallback chain</td>
+      </tr>
+      <tr>
+        <td>Retrieval subagent</td>
+        <td>QU</td>
+        <td><code>--retrieval-subagent</code></td>
+        <td>default / none / openai / openai-compatible</td>
+        <td>query diversity, BM25 explainability</td>
+      </tr>
+      <tr>
+        <td>Reranker</td>
+        <td>QU</td>
+        <td><code>--reranker</code></td>
+        <td>none / openai / openai-compatible</td>
+        <td>chunk_id whitelist, relevance ∈ [0, 1]</td>
+      </tr>
+      <tr>
+        <td>Answer judge</td>
+        <td>QU</td>
+        <td><code>--judge</code></td>
+        <td>openai / openai-compatible</td>
+        <td>can use a different model than planner (<code>--judge-model</code>)</td>
+      </tr>
+      <tr>
+        <td>Query bootstrapper</td>
+        <td>QU</td>
+        <td><code>--bootstrap-queries</code></td>
+        <td>openai / openai-compatible</td>
+        <td>source_type: synthetic_llm, label_status: unlabeled</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================== -->
+<!-- SECTION 6 : Observability                       -->
+<!-- ============================================== -->
+<section>
+  <h2>06 — Observability Stack</h2>
+  <h3 class="title">Artifacts and traces</h3>
+  <p class="deck">
+    Every run leaves structured JSON / JSONL artifacts. <code style="font-family:var(--mono);font-size:13px">orchestration_trace.jsonl</code>
+    is the unified event stream for the outer loop; detailed traces live in each phase's artifacts.
+  </p>
+
+  <div class="artifact-list">
+    <div class="row">
+      <code>orchestration_trace.jsonl</code>
+      <span class="kind">outer loop</span>
+      <span class="desc">7-phase event stream of loop_id + iteration + phase + agent + metrics + decision.</span>
+    </div>
+    <div class="row">
+      <code>loop_summary.json</code>
+      <span class="kind">outer loop</span>
+      <span class="desc">before / feedback / schema_delta / after / loop_result — the demo runner's final summary.</span>
+    </div>
+    <div class="row">
+      <code>manifest.json</code>
+      <span class="kind">CU root</span>
+      <span class="desc">dataset_id, record/chunk count, schema_induction (inducer + every field), feedback_refinement, prompt_state.</span>
+    </div>
+    <div class="row">
+      <code>silver_schema_catalog.json</code>
+      <span class="kind">CU contract</span>
+      <span class="desc">The query contract QU reads. fields[].search.{filterable,facetable,aggregatable}, evidence.ref_path, quality.</span>
+    </div>
+    <div class="row">
+      <code>silver_calls.jsonl</code>
+      <span class="kind">CU data</span>
+      <span class="desc">Per-call_id fields + evidence_refs + quality_flags (carries LLM validation errors).</span>
+    </div>
+    <div class="row">
+      <code>rlm_trace.jsonl</code>
+      <span class="kind">CU trace</span>
+      <span class="desc">root / sub-rlm tool events: induce_schema, search_chunks, extract_call_fields, evaluate_quality.</span>
+    </div>
+    <div class="row">
+      <code>feedback_report.json</code>
+      <span class="kind">CU feedback</span>
+      <span class="desc">accepted_into_schema / promoted_to_silver / validation_error_counts per QU request.</span>
+    </div>
+    <div class="row">
+      <code>query_tasks.jsonl</code>
+      <span class="kind">query pillar</span>
+      <span class="desc">task_id + source_type + label_status + adjusted_for(CU-state hash) + provenance(generator/model/prompt).</span>
+    </div>
+    <div class="row">
+      <code>query_bootstrap.json</code>
+      <span class="kind">query pillar</span>
+      <span class="desc">Audit of synthetic query generation: generator, model, prompt metadata, coverage_notes.</span>
+    </div>
+    <div class="row">
+      <code>baseline_answers/&lt;task_id&gt;.json</code>
+      <span class="kind">QU per-task</span>
+      <span class="desc">answer + plan + records + aggregation + evidence + judgement + column_requests + search_diagnostics + rerank + prompt_state + trace.</span>
+    </div>
+    <div class="row">
+      <code>column_requests.jsonl</code>
+      <span class="kind">QU → CU</span>
+      <span class="desc">QU's schema-gap proposals. Carries query + plan + column_requests + search_diagnostics + rerank + judgement.</span>
+    </div>
+    <div class="row">
+      <code>prompt_repair_request.jsonl</code>
+      <span class="kind">prompt pillar</span>
+      <span class="desc">Signal-only. action: collect_signal_only, promotion_gate: external_hand_labeled_eval_required.</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================== -->
+<!-- SECTION 7 : Issue Backlog                        -->
+<!-- ============================================== -->
+<section>
+  <h2>07 — Issue Backlog</h2>
+  <h3 class="title">Critical path: EVAL-001 → FB-002</h3>
+  <p class="deck">
+    The current self-improvement loop intentionally caps at 70–80% bootstrap quality and then defers to production query logs
+    and external hand-labeled fixtures. Resolving <b>EVAL-001</b> unblocks <b>FB-002</b>, enabling automatic prompt promotion.
+  </p>
+
+  <div class="issue-grid">
+    <div class="issue">
+      <span class="id">CU-001</span>
+      <span class="label">LLM-backed field extraction + validation</span>
+      <span class="status done">Done</span>
+    </div>
+    <div class="issue">
+      <span class="id">CU-002</span>
+      <span class="label">Open-world schema discovery</span>
+      <span class="status done">Done</span>
+    </div>
+    <div class="issue">
+      <span class="id">SYS-001</span>
+      <span class="label">Heuristic reliability layer + mode hygiene</span>
+      <span class="status done">Done</span>
+    </div>
+    <div class="issue">
+      <span class="id">CU-003</span>
+      <span class="label">Typed ontology policy</span>
+      <span class="status open">Open</span>
+    </div>
+    <div class="issue">
+      <span class="id">CU-004</span>
+      <span class="label">QU-to-CU schema refinement loop</span>
+      <span class="status done">Done</span>
+    </div>
+    <div class="issue">
+      <span class="id">CU-005</span>
+      <span class="label">Extraction quality calibration</span>
+      <span class="status open">Open</span>
+    </div>
+    <div class="issue">
+      <span class="id">QU-001</span>
+      <span class="label">Multi-step query plans</span>
+      <span class="status done">Done</span>
+    </div>
+    <div class="issue">
+      <span class="id">QU-002</span>
+      <span class="label">Agentic search iteration + diversity + reranking</span>
+      <span class="status done">Done</span>
+    </div>
+    <div class="issue">
+      <span class="id">QU-003</span>
+      <span class="label">Query language expressiveness</span>
+      <span class="status open">Open</span>
+    </div>
+    <div class="issue">
+      <span class="id">RET-001</span>
+      <span class="label">Semantic retrieval backend (BM25 + embedding)</span>
+      <span class="status done">Done</span>
+    </div>
+    <div class="issue">
+      <span class="id">AGG-001</span>
+      <span class="label">Rich aggregation expressions</span>
+      <span class="status open">Open</span>
+    </div>
+    <div class="issue">
+      <span class="id">EVID-001</span>
+      <span class="label">Span-level evidence + privacy filter</span>
+      <span class="status open">Open</span>
+    </div>
+    <div class="issue">
+      <span class="id">EVAL-001</span>
+      <span class="label">External hand-labeled fixtures</span>
+      <span class="status open">Open</span>
+    </div>
+    <div class="issue">
+      <span class="id">DBX-001</span>
+      <span class="label">Databricks production tool adapters</span>
+      <span class="status open">Open</span>
+    </div>
+    <div class="issue">
+      <span class="id">OBS-001</span>
+      <span class="label">Budget / observability / replay</span>
+      <span class="status partial">Partial</span>
+    </div>
+    <div class="issue">
+      <span class="id">FB-001</span>
+      <span class="label">Model-feedback + prompt improvement loop</span>
+      <span class="status partial">Partial</span>
+    </div>
+    <div class="issue">
+      <span class="id">FB-002</span>
+      <span class="label">Prompt lab + eval-gated promotion</span>
+      <span class="status blocked">Blocked on EVAL-001</span>
+    </div>
+    <div class="issue">
+      <span class="id">DE-001</span>
+      <span class="label">CU bootstrap context pack</span>
+      <span class="status design">Design</span>
+    </div>
+    <div class="issue">
+      <span class="id">DE-002</span>
+      <span class="label">CU-QU schema negotiation loop</span>
+      <span class="status design">Design</span>
+    </div>
+    <div class="issue">
+      <span class="id">DE-003</span>
+      <span class="label">Programmatic RLM sub-agent orchestration</span>
+      <span class="status partial">Partial</span>
+    </div>
+    <div class="issue">
+      <span class="id">DE-004</span>
+      <span class="label">Feedback routing beyond schema changes</span>
+      <span class="status design">Design</span>
+    </div>
+    <div class="issue">
+      <span class="id">DE-005</span>
+      <span class="label">Semantic recall evaluation + drift control</span>
+      <span class="status design">Design</span>
+    </div>
+    <div class="issue">
+      <span class="id">DE-006</span>
+      <span class="label">Schema lifecycle, backfill, governance</span>
+      <span class="status design">Design</span>
+    </div>
+    <div class="issue">
+      <span class="id">DE-007</span>
+      <span class="label">Human review + policy hooks</span>
+      <span class="status design">Design</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================== -->
+<!-- SECTION 8 : Design Principles                   -->
+<!-- ============================================== -->
+<section>
+  <h2>08 — Design Principles</h2>
+  <h3 class="title">10 things this architecture believes</h3>
+  <ol style="font-size: 15px; color: var(--ink); line-height: 1.7; padding-left: 22px; max-width: 900px;">
+    <li><b>Tool boundary is fixed at five tools.</b> Raw transcripts never reach an LLM; all references go through <code style="font-family:var(--mono);background:var(--bg-panel-alt);padding:1px 5px;border-radius:3px">chunk:&lt;id&gt;</code>.</li>
+    <li><b>All three pillars share versioned identity + promotion gate.</b> Catalog / prompts / queries follow the same lifecycle.</li>
+    <li><b>Every LLM path carries validator + fallback + provenance.</b> Trace shows <code>&lt;provider&gt;-&gt;fallback:&lt;base&gt;</code>; prompt_id + hash; composite provenance strings.</li>
+    <li><b><code style="font-family:var(--mono);background:var(--bg-panel-alt);padding:1px 5px;border-radius:3px">frozen=True</code> is a type-level guarantee against auto-mutation.</b> Changes require a new instance (a version bump).</li>
+    <li><b>Bake <code>PROMOTION_GATE</code> into the data.</b> "Why we don't promote" is recorded in the artifact itself.</li>
+    <li><b>Operationally separate self-eval bias.</b> Judge ↔ planner model separation; synthetic queries stay outside promotion gates.</li>
+    <li><b>LLM-first + reliability fallback.</b> Semantic decisions belong to the LLM; heuristics only catch validation/API failures and support smoke tests.</li>
+    <li><b>Append-only signal logs.</b> column_requests / prompt_repair_request / orchestration_trace accumulate over time and are aggregated downstream.</li>
+    <li><b>Keep deterministic control.</b> BM25 explainability, query diversity, forced search iteration, and smoke eval are retained as reliability infrastructure.</li>
+    <li><b>Observability via structured JSON.</b> Trace tool names expand backend / provider / fallback chain into strings.</li>
+  </ol>
+</section>
+
+<footer class="foot">
+  <span>cu-agent-rlm × qu-agent-rlm</span>
+  <span>schema_version silver.rlm.v1 · prompt baseline 2026-05-29.1</span>
+  <span>last reviewed 2026-05-30</span>
+</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,19 @@
+[project]
+name = "qu-agent-rlm"
+version = "0.1.0"
+description = "RLM-style query-understanding prototype over CU silver artifacts."
+requires-python = ">=3.10"
+dependencies = [
+    "bm25s>=0.3.9,<0.4",
+    "rich>=14.3.3",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+qu-agent-rlm = "qu_agent_rlm.cli:main"
