@@ -27,6 +27,7 @@ from qu_agent_rlm.query_tasks import (
     dedupe_query_tasks,
 )
 from qu_agent_rlm.retrieval import BM25Index
+from qu_agent_rlm.usage import UsageSummary
 
 
 class QueryUnderstandingRLMTest(unittest.TestCase):
@@ -106,6 +107,58 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertTrue(result["aggregation"])
             self.assertEqual(result["prompt_state"]["planner"]["prompt_id"], "qu.query_planner")
             self.assertIn("prompt_hash", result["prompt_state"]["planner"])
+
+    def test_usage_summary_accumulates_query_llm_calls(self) -> None:
+        sample = workspace / "legacy" / "cu-agent" / "data" / "sample_calls.jsonl"
+        source_sql = workspace / "call_records.sql"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "corpus"
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            planner_client = FakeJSONClient(
+                {
+                    "operation": "search",
+                    "filters": {},
+                    "retrieve_evidence": True,
+                    "ranking_query": "security review",
+                    "steps": [
+                        {
+                            "tool": "bm25_search_chunks",
+                            "arguments": {"query": "security review", "limit": 2},
+                            "purpose": "Find matching security chunks.",
+                        }
+                    ],
+                    "reasoning": "Search for evidence.",
+                },
+                usage={"model": "fake-planner", "input_tokens": 90, "output_tokens": 10},
+            )
+            judge_client = FakeJSONClient(
+                {
+                    "answerable": True,
+                    "evidence_sufficient": True,
+                    "success": True,
+                    "needs_cu_feedback": False,
+                    "confidence": "high",
+                    "failure_modes": [],
+                    "missing_field_requests": [],
+                    "rationale": "Supported.",
+                },
+                usage={"model": "fake-judge", "input_tokens": 80, "output_tokens": 12},
+            )
+            agent = QueryUnderstandingAgent(
+                SilverCorpus.from_dir(output),
+                planner=LLMQueryPlanner(planner_client),
+                answer_judge=LLMAnswerJudge(judge_client),
+            )
+
+            result = agent.answer("Which calls mention security review?", limit=2)
+
+            usage = result["usage_summary"]
+            self.assertEqual(usage["total_calls"], 2)
+            self.assertEqual(usage["input_tokens"], 170)
+            self.assertEqual(usage["output_tokens"], 22)
+            self.assertEqual(usage["by_model"]["fake-planner"]["total_calls"], 1)
+            self.assertEqual(usage["by_model"]["fake-judge"]["total_calls"], 1)
 
     def test_search_only_query_emits_column_request_for_cu_feedback(self) -> None:
         sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
@@ -586,12 +639,20 @@ class Sid1StyleRetrievalSubAgent:
 class FakeJSONClient:
     provider_name = "fake-llm"
 
-    def __init__(self, payload):
+    def __init__(self, payload, usage=None):
         self.payload = payload
+        self.usage = usage
+        self.usage_summary = UsageSummary()
 
     def complete_json(self, *, system, user):
         self.system = system
         self.user = user
+        if self.usage:
+            self.usage_summary.add_call(
+                model=self.usage["model"],
+                input_tokens=self.usage["input_tokens"],
+                output_tokens=self.usage["output_tokens"],
+            )
         return self.payload
 
 
@@ -600,6 +661,7 @@ class FakeSequenceJSONClient:
         self.payloads = list(payloads)
         self.provider_name = provider_name
         self.calls = []
+        self.usage_summary = UsageSummary()
 
     def complete_json(self, *, system, user):
         self.calls.append({"system": system, "user": user})

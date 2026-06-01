@@ -709,6 +709,7 @@ def orchestration_event(
 
 
 def cu_metrics(artifact: Any) -> dict[str, Any]:
+    usage = artifact.manifest.get("usage_summary", {})
     return {
         "record_count": artifact.manifest.get("record_count"),
         "chunk_count": artifact.manifest.get("chunk_count"),
@@ -716,12 +717,18 @@ def cu_metrics(artifact: Any) -> dict[str, Any]:
         "trace_event_count": len(artifact.trace),
         "feedback_request_count": artifact.feedback_report.get("feedback", {}).get("request_count", 0),
         "validation_error_count": sum(artifact.feedback_report.get("validation_error_counts", {}).values()),
+        "llm_call_count": usage.get("total_calls", 0),
+        "llm_input_tokens": usage.get("input_tokens", 0),
+        "llm_output_tokens": usage.get("output_tokens", 0),
+        "llm_total_tokens": usage.get("total_tokens", 0),
+        "llm_total_cost_usd": usage.get("total_cost_usd", 0.0),
     }
 
 
 def qu_metrics(answer: dict[str, Any]) -> dict[str, Any]:
     judgement = answer.get("judgement", {})
     diagnostics = answer.get("search_diagnostics", {})
+    usage = answer.get("usage_summary", {})
     return {
         "operation": answer.get("plan", {}).get("operation"),
         "record_count": len(answer.get("records", [])),
@@ -732,6 +739,11 @@ def qu_metrics(answer: dict[str, Any]) -> dict[str, Any]:
         "judge_success": judgement.get("success"),
         "judge_confidence": judgement.get("confidence"),
         "needs_cu_feedback": judgement.get("needs_cu_feedback"),
+        "llm_call_count": usage.get("total_calls", 0),
+        "llm_input_tokens": usage.get("input_tokens", 0),
+        "llm_output_tokens": usage.get("output_tokens", 0),
+        "llm_total_tokens": usage.get("total_tokens", 0),
+        "llm_total_cost_usd": usage.get("total_cost_usd", 0.0),
     }
 
 

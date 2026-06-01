@@ -416,6 +416,7 @@ def compact_query_task(task: dict[str, Any]) -> dict[str, Any]:
 def answer_metrics(answer: dict[str, Any]) -> dict[str, Any]:
     diagnostics = answer.get("search_diagnostics", {})
     judgement = answer.get("judgement", {})
+    usage = answer.get("usage_summary", {})
     return {
         "operation": answer.get("plan", {}).get("operation"),
         "record_count": len(answer.get("records", [])),
@@ -426,6 +427,11 @@ def answer_metrics(answer: dict[str, Any]) -> dict[str, Any]:
         "search_failure_count": len(diagnostics.get("failures", [])),
         "judge_success": judgement.get("success"),
         "needs_cu_feedback": judgement.get("needs_cu_feedback"),
+        "llm_call_count": usage.get("total_calls", 0),
+        "llm_input_tokens": usage.get("input_tokens", 0),
+        "llm_output_tokens": usage.get("output_tokens", 0),
+        "llm_total_tokens": usage.get("total_tokens", 0),
+        "llm_total_cost_usd": usage.get("total_cost_usd", 0.0),
     }
 
 

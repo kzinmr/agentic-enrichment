@@ -29,6 +29,7 @@ from .models import (
     TraceEvent,
 )
 from .schema import HeuristicSchemaInducer, SchemaInducer
+from .usage import usage_summary_from_components
 
 
 def run_content_understanding(
@@ -130,6 +131,7 @@ def analyze_calls(
         extractions.extend(call_extractions)
 
     manifest["prompt_state"] = prompt_state(inducer, extractor)
+    manifest["usage_summary"] = usage_summary_from_components(inducer, extractor)
     quality_report = build_quality_report(schema_specs, extractions, total_calls=len(calls))
     promoted_specs = promoted_fields(schema_specs, quality_report)
     silver_calls = materialize_silver_calls(calls, promoted_specs, extractions)

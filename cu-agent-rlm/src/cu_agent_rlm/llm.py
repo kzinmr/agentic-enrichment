@@ -6,6 +6,8 @@ from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .usage import UsageSummary, cost_for_tokens, pricing_from_env, usage_from_response
+
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
@@ -37,6 +39,8 @@ class OpenAIResponsesClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY")
         self.timeout_seconds = timeout_seconds
+        self.usage_summary = UsageSummary()
+        self.pricing = pricing_from_env()
         if not self.api_key:
             raise LLMError("OPENAI_API_KEY is required for openai mode.")
 
@@ -54,7 +58,19 @@ class OpenAIResponsesClient:
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout_seconds=self.timeout_seconds,
         )
+        self.record_usage(response)
         return parse_json_object(extract_responses_text(response))
+
+    def record_usage(self, response: dict[str, Any]) -> None:
+        input_tokens, output_tokens, total_tokens = usage_from_response(response)
+        self.usage_summary.add_call(
+            model=self.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost_for_tokens(input_tokens, output_tokens, self.pricing),
+            pricing=self.pricing,
+        )
 
 
 class OpenAICompatibleChatClient:
@@ -72,6 +88,8 @@ class OpenAICompatibleChatClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY")
         self.timeout_seconds = timeout_seconds
+        self.usage_summary = UsageSummary()
+        self.pricing = pricing_from_env()
         if not self.api_key:
             raise LLMError("OPENAI_API_KEY is required for openai-compatible extractor mode.")
 
@@ -90,11 +108,23 @@ class OpenAICompatibleChatClient:
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout_seconds=self.timeout_seconds,
         )
+        self.record_usage(response)
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"Chat completions response missing message content: {response}") from exc
         return parse_json_object(str(content))
+
+    def record_usage(self, response: dict[str, Any]) -> None:
+        input_tokens, output_tokens, total_tokens = usage_from_response(response)
+        self.usage_summary.add_call(
+            model=self.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost_for_tokens(input_tokens, output_tokens, self.pricing),
+            pricing=self.pricing,
+        )
 
 
 def extract_responses_text(response: dict[str, Any]) -> str:

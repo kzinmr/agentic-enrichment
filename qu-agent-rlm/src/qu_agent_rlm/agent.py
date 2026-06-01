@@ -16,6 +16,7 @@ from .planner import (
 )
 from .retrieval import english_tokenize
 from .retrieval_agent import AgenticRetrievalSubAgent, RetrievalSubAgent, SearchExecutionPolicy
+from .usage import usage_summary_from_components
 
 
 SEARCH_TOOL_NAMES = {"search_chunks", "bm25_search_chunks", "embedding_search_chunks"}
@@ -161,6 +162,13 @@ class QueryUnderstandingAgent:
             judgement=judgement,
             retrieval_subagent=self.retrieval_subagent.name,
             prompt_state=self.prompt_state(judgement, state),
+            usage_summary=usage_summary_from_components(
+                self.planner,
+                self.search_controller,
+                self.reranker,
+                self.retrieval_subagent,
+                self.answer_judge,
+            ),
         )
 
     def prompt_state(self, judgement: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
@@ -372,6 +380,7 @@ def result_payload(
     judgement: dict[str, Any],
     retrieval_subagent: str,
     prompt_state: dict[str, Any],
+    usage_summary: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "query": query,
@@ -385,6 +394,7 @@ def result_payload(
         "rerank": rerank,
         "judgement": judgement,
         "prompt_state": prompt_state,
+        "usage_summary": usage_summary,
         "trace": [asdict(event) for event in trace],
     }
 

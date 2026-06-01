@@ -16,6 +16,7 @@ from cu_agent_rlm.io import load_calls
 from cu_agent_rlm.llm import DEFAULT_OPENAI_MODEL
 from cu_agent_rlm.pipeline import analyze_calls
 from cu_agent_rlm.schema import LLMSchemaInducer, StaticSchemaInducer
+from cu_agent_rlm.usage import UsageSummary
 
 
 class ContentUnderstandingRLMTest(unittest.TestCase):
@@ -242,6 +243,53 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
         self.assertEqual(artifact.manifest["prompt_state"]["field_extractor"]["prompt_id"], "cu.field_extraction")
         self.assertIn("prompt_hash", artifact.manifest["prompt_state"]["schema_inducer"])
 
+    def test_usage_summary_accumulates_llm_schema_and_extraction_calls(self) -> None:
+        workspace = Path(__file__).resolve().parents[2]
+        sample = workspace / "legacy" / "cu-agent" / "data" / "sample_calls.jsonl"
+        calls = load_calls(sample)[:1]
+        schema_client = FakeJSONClient(
+            {
+                "fields": [
+                    {
+                        "name": "compliance_requirement",
+                        "type": "list",
+                        "description": "Compliance requirements mentioned by the customer.",
+                        "allowed_values": ["sso"],
+                        "downstream_use_cases": ["filtering"],
+                    }
+                ]
+            },
+            usage={"model": "fake-schema", "input_tokens": 100, "output_tokens": 20},
+        )
+        extraction_client = FakeJSONClient(
+            {
+                "fields": [
+                    {
+                        "name": "compliance_requirement",
+                        "value": ["sso"],
+                        "confidence": "high",
+                        "evidence_refs": ["chunk:call-001:chunk-001"],
+                        "abstained": False,
+                        "rationale": "The call mentions SSO.",
+                    }
+                ]
+            },
+            usage={"model": "fake-extraction", "input_tokens": 200, "output_tokens": 30},
+        )
+
+        artifact = analyze_calls(
+            calls,
+            schema_inducer=LLMSchemaInducer(schema_client),
+            field_extractor=LLMFieldExtractor(extraction_client),
+        )
+
+        usage = artifact.manifest["usage_summary"]
+        self.assertEqual(usage["total_calls"], 2)
+        self.assertEqual(usage["input_tokens"], 300)
+        self.assertEqual(usage["output_tokens"], 50)
+        self.assertEqual(usage["by_model"]["fake-schema"]["total_calls"], 1)
+        self.assertEqual(usage["by_model"]["fake-extraction"]["total_calls"], 1)
+
     def test_cli_loads_openai_env_file_without_printing_secret_defaults(self) -> None:
         keys = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL")
         previous = {key: os.environ.get(key) for key in keys}
@@ -282,12 +330,20 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
 class FakeJSONClient:
     provider_name = "fake-llm"
 
-    def __init__(self, payload):
+    def __init__(self, payload, usage=None):
         self.payload = payload
+        self.usage = usage
+        self.usage_summary = UsageSummary()
 
     def complete_json(self, *, system, user):
         self.system = system
         self.user = user
+        if self.usage:
+            self.usage_summary.add_call(
+                model=self.usage["model"],
+                input_tokens=self.usage["input_tokens"],
+                output_tokens=self.usage["output_tokens"],
+            )
         return self.payload
 
 
