@@ -59,8 +59,13 @@ DEFAULT_QUERY = "Which calls mention founder-led sales calls?"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a QU-CU feedback loop demo.")
-    parser.add_argument("--input", type=Path, default=REPO_ROOT / "cu-agent" / "data" / "sample_calls.jsonl")
-    parser.add_argument("--source-sql", type=Path, default=REPO_ROOT / "call_records.sql")
+    parser.add_argument("--input", type=Path, default=REPO_ROOT / "data" / "sample_calls.jsonl")
+    parser.add_argument(
+        "--source-sql",
+        type=Path,
+        default=None,
+        help="Optional Databricks source SQL; omit to use the intrinsic call_records column list.",
+    )
     parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "output" / "qu_cu_loop_demo")
     parser.add_argument("--query", default=DEFAULT_QUERY)
     parser.add_argument("--skip-default-query", action="store_true")

@@ -16,7 +16,6 @@ The CLI path is LLM-first: schema induction and field extraction call the config
 cd cu-agent-rlm
 uv run cu-agent-rlm \
   --input ../cu-agent/data/sample_calls.jsonl \
-  --source-sql ../call_records.sql \
   --output output/demo
 ```
 
@@ -29,7 +28,6 @@ uv run cu-agent-rlm \
   --llm-model gpt-5.4-mini \
   --env-file ../.env \
   --input ../cu-agent/data/sample_calls.jsonl \
-  --source-sql ../call_records.sql \
   --output output/openai-demo
 ```
 
@@ -40,7 +38,6 @@ Feed QU failures, column requests, and answerability/evidence judgement back int
 ```bash
 uv run cu-agent-rlm \
   --input ../cu-agent/data/sample_calls.jsonl \
-  --source-sql ../call_records.sql \
   --feedback-input ../qu-agent-rlm/output/cu_column_requests.jsonl \
   --output output/refined
 ```
@@ -71,7 +68,6 @@ uv run cu-agent-rlm \
   --llm-model gpt-5.4-mini \
   --env-file ../.env \
   --input ../cu-agent/data/sample_calls.jsonl \
-  --source-sql ../call_records.sql \
   --output output/api-demo
 ```
 

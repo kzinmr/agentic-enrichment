@@ -614,7 +614,7 @@ def build_silver_schema_catalog(specs: list[FieldSpec], quality_report: dict[str
 
 
 def build_databricks_contract(source_sql: Path | None, catalog: dict[str, Any]) -> dict[str, Any]:
-    sql_text = source_sql.read_text(encoding="utf-8") if source_sql else ""
+    sql_text = source_sql.read_text(encoding="utf-8") if source_sql and source_sql.exists() else ""
     return {
         "source": {
             "system": "databricks",

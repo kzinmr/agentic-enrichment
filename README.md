@@ -116,7 +116,7 @@ agent-native/
 │   ├── architecture.en.html   # English single-file visualization
 │   ├── architecture.md        # Japanese version
 │   └── architecture.html      # Japanese version
-├── call_records.sql      # Databricks source SQL for production wiring
+├── call_records.sql      # optional Databricks source SQL for production wiring (AS-aliases augment observed_columns; safe to omit)
 ├── cu-agent/             # legacy non-RLM CU (kept for reference)
 ├── qu-agent/             # legacy non-RLM QU (kept for reference)
 └── output/               # demo outputs (gitignored)
@@ -134,7 +134,6 @@ The two `*-agent-rlm` packages are standalone — they ship `pyproject.toml`, ar
 cd cu-agent-rlm
 python3 -m cu_agent_rlm.cli \
     --input ../cu-agent/data/sample_calls.jsonl \
-    --source-sql ../call_records.sql \
     --output output/demo \
     --schema-inducer openai \
     --extractor openai

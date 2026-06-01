@@ -26,7 +26,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", type=Path, default=Path("../cu-agent/data/sample_calls.jsonl"))
     parser.add_argument("--output", type=Path, default=Path("output/demo"))
-    parser.add_argument("--source-sql", type=Path, default=Path("../call_records.sql"))
+    parser.add_argument(
+        "--source-sql",
+        type=Path,
+        default=None,
+        help="Optional Databricks source SQL. Only its AS-aliases augment observed_columns; "
+        "omit it to fall back to the intrinsic call_records column list.",
+    )
     parser.add_argument(
         "--feedback-input",
         type=Path,
