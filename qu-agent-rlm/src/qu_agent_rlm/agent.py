@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 import time
 from typing import Any
@@ -21,6 +22,9 @@ from .usage import usage_delta, usage_summary_from_components
 
 
 SEARCH_TOOL_NAMES = {"search_chunks", "bm25_search_chunks", "embedding_search_chunks"}
+MAX_SUBQUERY_FANOUT = 20
+SUBQUERY_FANOUT_CONCURRENCY = 8
+SUBQUERY_DIVERSITY_THRESHOLD = 0.8
 
 
 class QueryUnderstandingAgent:
@@ -286,41 +290,49 @@ class QueryUnderstandingAgent:
     ) -> None:
         arguments = dict(step.arguments)
         if step.tool in {"search_chunks", "bm25_search_chunks", "embedding_search_chunks"}:
-            step_query = str(arguments.get("query") or plan.ranking_query or query)
             filters = filters_from_arguments(arguments, default=plan.filters)
             step_limit = bounded_limit(arguments.get("limit"), default=limit)
-            chunks = self.search_with_tool(step.tool, step_query, filters=filters, limit=step_limit)
+            subqueries = normalize_subqueries(arguments, fallback=plan.ranking_query or query)
+            promote = plan.operation == "search" or bool(arguments.get("promote_records"))
             trace_tool = self.trace_tool_name(step.tool)
-            state["chunks"] = merge_chunks(state["chunks"], chunks)
-            if plan.operation == "search" or bool(arguments.get("promote_records")):
-                state["records"] = merge_records(state["records"], records_for_chunks(self.corpus, chunks))
-            search_call = summarize_search_call(
-                tool=trace_tool,
-                query=step_query,
-                filters=filters,
-                chunks=chunks,
-                purpose=step.purpose,
-            )
-            state["search_calls"].append(search_call)
-            if search_call.get("failure_reason"):
-                state["search_failures"] = dedupe_dicts(
-                    [*state["search_failures"], search_call],
-                    key="failure_reason",
-                )
-            trace.append(
-                ToolEvent(
-                    step=len(trace) + 1,
+            fanout = len(subqueries)
+            # map: run each subquery's retrieval (in parallel when the plan fans out),
+            # then reduce by merging chunks/records with the existing dedupe helpers.
+            results = self.run_subquery_searches(step.tool, subqueries, filters=filters, limit=step_limit)
+            for sub_query, chunks in zip(subqueries, results):
+                state["chunks"] = merge_chunks(state["chunks"], chunks)
+                if promote:
+                    state["records"] = merge_records(state["records"], records_for_chunks(self.corpus, chunks))
+                search_call = summarize_search_call(
                     tool=trace_tool,
-                    arguments={
-                        "query": step_query,
-                        "filters": filters,
-                        "limit": step_limit,
-                        "purpose": step.purpose,
-                        "query_terms": search_call["query_terms"],
-                    },
-                    result_summary=search_call["summary"],
+                    query=sub_query,
+                    filters=filters,
+                    chunks=chunks,
+                    purpose=step.purpose,
                 )
-            )
+                state["search_calls"].append(search_call)
+                if search_call.get("failure_reason"):
+                    state["search_failures"] = dedupe_dicts(
+                        [*state["search_failures"], search_call],
+                        key="failure_reason",
+                    )
+                event_arguments: dict[str, Any] = {
+                    "query": sub_query,
+                    "filters": filters,
+                    "limit": step_limit,
+                    "purpose": step.purpose,
+                    "query_terms": search_call["query_terms"],
+                }
+                if fanout > 1:
+                    event_arguments["fanout"] = fanout
+                trace.append(
+                    ToolEvent(
+                        step=len(trace) + 1,
+                        tool=trace_tool,
+                        arguments=event_arguments,
+                        result_summary=search_call["summary"],
+                    )
+                )
             return
 
         if step.tool == "query_silver":
@@ -420,6 +432,29 @@ class QueryUnderstandingAgent:
         if self.retrieval_mode == "hybrid":
             return self.corpus.hybrid_search_chunks(query, filters=active_filters, limit=limit)
         return self.corpus.bm25_search_chunks(query, filters=active_filters, limit=limit)
+
+    def run_subquery_searches(
+        self,
+        tool: str,
+        subqueries: list[str],
+        *,
+        filters: dict[str, Any],
+        limit: int,
+    ) -> list[list[dict[str, Any]]]:
+        # Searches are independent reads over the corpus, so a fan-out runs them concurrently.
+        # Results are returned in subquery order so the downstream reduce stays deterministic.
+        if len(subqueries) <= 1:
+            return [self.search_with_tool(tool, sub_query, filters=filters, limit=limit) for sub_query in subqueries]
+        results: list[list[dict[str, Any]]] = [[] for _ in subqueries]
+        workers = min(len(subqueries), SUBQUERY_FANOUT_CONCURRENCY)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(self.search_with_tool, tool, sub_query, filters=filters, limit=limit): index
+                for index, sub_query in enumerate(subqueries)
+            }
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        return results
 
     def trace_tool_name(self, tool: str) -> str:
         if tool == "bm25_search_chunks" and self.retrieval_mode == "embedding":
@@ -908,6 +943,49 @@ def diversified_query(query: str, search_calls: list[dict[str, Any]]) -> str:
         return " ".join(missing_terms[:8])
     values = suggested_values_from_query(query)
     return " ".join(values[1:] or values)
+
+
+def normalize_subqueries(arguments: dict[str, Any], *, fallback: str) -> list[str]:
+    """Resolve a search step into its list of subqueries (one element for the common case).
+
+    A fan-out plan supplies ``arguments["queries"]``; otherwise the single ``query`` (or the
+    plan's ranking query) is used. Near-duplicate subqueries are dropped so the fan-out spends
+    its budget on diverse retrieval rather than repeating itself.
+    """
+    raw = arguments.get("queries")
+    queries: list[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            text = str(item).strip()
+            if text:
+                queries.append(text)
+    if not queries:
+        single = str(arguments.get("query") or fallback or "").strip()
+        if single:
+            queries = [single]
+    return diverse_subqueries(queries)[:MAX_SUBQUERY_FANOUT]
+
+
+def diverse_subqueries(queries: list[str], *, threshold: float = SUBQUERY_DIVERSITY_THRESHOLD) -> list[str]:
+    kept: list[str] = []
+    kept_terms: list[set[str]] = []
+    for candidate in queries:
+        terms = set(english_tokenize(candidate))
+        normalized = normalize_query(candidate)
+        duplicate = False
+        for existing, existing_terms in zip(kept, kept_terms):
+            if normalize_query(existing) == normalized:
+                duplicate = True
+                break
+            if terms and existing_terms:
+                overlap = len(terms & existing_terms) / len(terms | existing_terms)
+                if overlap > threshold:
+                    duplicate = True
+                    break
+        if not duplicate:
+            kept.append(candidate)
+            kept_terms.append(terms)
+    return kept
 
 
 def normalize_ref_list(raw: Any) -> list[str]:

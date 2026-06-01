@@ -236,14 +236,23 @@ class AgenticRetrievalSubAgent:
         tool = str(payload.get("tool", "")).strip()
         if tool not in available_tools:
             raise ValueError(f"Retrieval subagent selected unavailable tool: {tool}")
+        step_limit = bounded_limit(payload.get("limit"), default=min(limit, 8))
+        purpose = str(payload.get("reason", "")).strip() or f"{self.name} follow-up retrieval."
+        fanout_queries = normalize_subquery_payload(payload.get("queries"))
+        if fanout_queries:
+            # The controller can split one decision into several parallel subqueries.
+            return QueryToolStep(
+                tool=tool,
+                arguments={"queries": fanout_queries, "filters": plan.filters, "limit": step_limit, "promote_records": True},
+                purpose=purpose,
+            )
         next_query = str(payload.get("query", "")).strip()
         if not next_query:
             raise ValueError("Retrieval subagent selected an empty query")
-        step_limit = bounded_limit(payload.get("limit"), default=min(limit, 8))
         return QueryToolStep(
             tool=tool,
             arguments={"query": next_query, "filters": plan.filters, "limit": step_limit, "promote_records": True},
-            purpose=str(payload.get("reason", "")).strip() or f"{self.name} follow-up retrieval.",
+            purpose=purpose,
         )
 
     def forced_search_iteration(
@@ -280,22 +289,37 @@ class AgenticRetrievalSubAgent:
         *,
         trace_tool_name: Any,
     ) -> str:
-        query = str(step.arguments.get("query", "")).strip()
-        if not query:
+        # A fan-out step carries several subqueries; each is checked against prior calls and
+        # against the earlier subqueries in the same step so the fan-out stays diverse too.
+        subqueries = step_subqueries(step)
+        if not subqueries:
             return "Rejected empty search query."
-        candidate_terms = set(english_tokenize(query))
-        for call in previous_calls:
-            previous_query = str(call.get("query", ""))
-            if call.get("tool") == trace_tool_name(step.tool) and normalize_query(previous_query) == normalize_query(query):
+        tool_name = trace_tool_name(step.tool)
+        prior_terms: list[set[str]] = [
+            set(call.get("query_terms") or english_tokenize(str(call.get("query", ""))))
+            for call in previous_calls
+            if call.get("tool") == tool_name
+        ]
+        prior_normalized = {
+            normalize_query(str(call.get("query", "")))
+            for call in previous_calls
+            if call.get("tool") == tool_name
+        }
+        seen_terms: list[set[str]] = []
+        seen_normalized: set[str] = set()
+        for query in subqueries:
+            candidate_terms = set(english_tokenize(query))
+            normalized = normalize_query(query)
+            if normalized in prior_normalized or normalized in seen_normalized:
                 return "Rejected duplicate query/tool pair."
-            if call.get("tool") != trace_tool_name(step.tool):
-                continue
-            previous_terms = set(call.get("query_terms") or english_tokenize(previous_query))
-            if not candidate_terms or not previous_terms:
-                continue
-            overlap = len(candidate_terms & previous_terms) / len(candidate_terms | previous_terms)
-            if overlap > self.policy.query_diversity_threshold:
-                return f"Rejected low-diversity query for {step.tool}: term overlap={overlap:.2f}."
+            for previous_terms in (*prior_terms, *seen_terms):
+                if not candidate_terms or not previous_terms:
+                    continue
+                overlap = len(candidate_terms & previous_terms) / len(candidate_terms | previous_terms)
+                if overlap > self.policy.query_diversity_threshold:
+                    return f"Rejected low-diversity query for {step.tool}: term overlap={overlap:.2f}."
+            seen_terms.append(candidate_terms)
+            seen_normalized.add(normalized)
         return ""
 
     def finalize(
@@ -537,6 +561,25 @@ def dedupe_dicts(values: list[dict[str, Any]], *, key: str) -> list[dict[str, An
 
 def normalize_query(query: str) -> str:
     return " ".join(english_tokenize(query))
+
+
+def normalize_subquery_payload(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    queries: list[str] = []
+    for item in raw:
+        text = str(item).strip()
+        if text and text not in queries:
+            queries.append(text)
+    return queries[:20]
+
+
+def step_subqueries(step: QueryToolStep) -> list[str]:
+    queries = normalize_subquery_payload(step.arguments.get("queries"))
+    if queries:
+        return queries
+    single = str(step.arguments.get("query", "")).strip()
+    return [single] if single else []
 
 
 def diversified_query(query: str, search_calls: list[dict[str, Any]]) -> str:

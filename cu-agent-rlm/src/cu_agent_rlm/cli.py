@@ -67,6 +67,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-errors", type=int, default=3)
     parser.add_argument("--max-budget-usd", type=float, default=None)
     parser.add_argument("--max-timeout-seconds", type=float, default=None)
+    parser.add_argument(
+        "--batch-max-concurrent",
+        type=int,
+        default=8,
+        help=(
+            "Maximum number of per-call field extractions to run concurrently. "
+            "1 forces sequential extraction; results are identical regardless of this value."
+        ),
+    )
     return parser
 
 
@@ -98,6 +107,7 @@ def main() -> int:
         max_errors=args.max_errors,
         max_budget_usd=args.max_budget_usd,
         max_timeout_seconds=args.max_timeout_seconds,
+        batch_max_concurrent=args.batch_max_concurrent,
     )
     promoted_count = len(artifact.silver_schema_catalog["fields"])
     print(f"Wrote CU RLM artifacts to {args.output}")

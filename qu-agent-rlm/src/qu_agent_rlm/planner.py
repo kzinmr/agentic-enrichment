@@ -380,10 +380,33 @@ def validate_steps(raw_steps: Any, plan: QueryPlan, fields: dict[str, dict[str, 
     return steps
 
 
+SEARCH_STEP_TOOLS = {"search_chunks", "bm25_search_chunks", "embedding_search_chunks"}
+MAX_SUBQUERY_FANOUT = 20
+
+
 def validate_step_arguments(tool: str, arguments: dict[str, Any], fields: dict[str, dict[str, Any]]) -> dict[str, Any]:
     validated = dict(arguments)
     if "filters" in validated and validated["filters"] not in (None, {}, ""):
         validated["filters"] = validate_filters(validated["filters"], fields)
+    if "queries" in validated:
+        # A search step may declare a fan-out of subqueries (map-reduce): run each in parallel
+        # and merge the results. Bounded to keep fan-out within the "thick prompt, small batch"
+        # envelope. Non-search tools cannot fan out, so the key is dropped for them.
+        if tool in SEARCH_STEP_TOOLS:
+            raw = validated["queries"]
+            if not isinstance(raw, list):
+                raise ValueError(f"queries for {tool} must be an array")
+            subqueries: list[str] = []
+            for item in raw:
+                text = str(item).strip()
+                if text and text not in subqueries:
+                    subqueries.append(text)
+            if subqueries:
+                validated["queries"] = subqueries[:MAX_SUBQUERY_FANOUT]
+            else:
+                validated.pop("queries")
+        else:
+            validated.pop("queries")
     if tool == "aggregate_silver":
         group_by = validated.get("group_by")
         if not isinstance(group_by, str) or group_by not in fields:

@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -308,6 +310,38 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
         self.assertEqual(error_event.validation_result, "error")
         self.assertTrue(error_event.fallback_reason)
 
+    def test_batched_extraction_matches_sequential_and_runs_concurrently(self) -> None:
+        calls = many_sample_call_records(6)
+        payload = {"fields": []}
+
+        sequential_client = ConcurrencyProbeClient(payload)
+        sequential = analyze_calls(
+            calls,
+            schema_inducer=StaticSchemaInducer(),
+            field_extractor=LLMFieldExtractor(sequential_client),
+            batch_max_concurrent=1,
+        )
+
+        concurrent_client = ConcurrencyProbeClient(payload)
+        concurrent = analyze_calls(
+            calls,
+            schema_inducer=StaticSchemaInducer(),
+            field_extractor=LLMFieldExtractor(concurrent_client),
+            batch_max_concurrent=4,
+        )
+
+        def signature(artifact):
+            return [
+                (item.call_id, item.field_name, json.dumps(item.value, sort_keys=True), item.abstained)
+                for item in artifact.extractions
+            ]
+
+        self.assertEqual(signature(sequential), signature(concurrent))
+        self.assertEqual(sequential_client.max_active, 1)
+        self.assertGreaterEqual(concurrent_client.max_active, 2)
+        extraction_events = [event for event in concurrent.trace if event.tool == "extract_call_fields"]
+        self.assertEqual(len(extraction_events), len(calls))
+
     def test_redact_for_replay_strips_raw_text_keeps_structure(self) -> None:
         payload = {
             "chunk_id": "c1",
@@ -409,6 +443,46 @@ class FakeJSONClient:
                 output_tokens=self.usage["output_tokens"],
             )
         return self.payload
+
+
+class ConcurrencyProbeClient:
+    provider_name = "probe-llm"
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.usage_summary = UsageSummary()
+        self._lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def complete_json(self, *, system, user):
+        del system, user
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(0.02)
+        with self._lock:
+            self.active -= 1
+        return self.payload
+
+
+def many_sample_call_records(count: int) -> list[CallRecord]:
+    base = sample_call_records()
+    records: list[CallRecord] = []
+    for index in range(count):
+        template = base[index % len(base)]
+        records.append(
+            CallRecord(
+                call_id=f"call-{index:03d}",
+                customer_id=template.customer_id,
+                account_name=template.account_name,
+                date=template.date,
+                transcript=template.transcript,
+                turns=template.turns,
+                metadata=dict(template.metadata),
+            )
+        )
+    return records
 
 
 class FailingFieldExtractor:

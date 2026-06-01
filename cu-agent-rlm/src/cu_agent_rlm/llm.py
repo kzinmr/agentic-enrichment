@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -24,6 +25,10 @@ class JSONChatClient(Protocol):
         raise NotImplementedError
 
 
+def empty_call_usage() -> dict[str, Any]:
+    return {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "total_cost_usd": 0.0}
+
+
 class OpenAIResponsesClient:
     provider_name = "openai"
 
@@ -41,10 +46,15 @@ class OpenAIResponsesClient:
         self.timeout_seconds = timeout_seconds
         self.usage_summary = UsageSummary()
         self.pricing = pricing_from_env()
+        self._usage_lock = threading.Lock()
         if not self.api_key:
             raise LLMError("OPENAI_API_KEY is required for openai mode.")
 
     def complete_json(self, *, system: str, user: str) -> dict[str, Any]:
+        payload, _ = self.complete_json_with_usage(system=system, user=user)
+        return payload
+
+    def complete_json_with_usage(self, *, system: str, user: str) -> tuple[dict[str, Any], dict[str, Any]]:
         payload = {
             "model": self.model,
             "instructions": system,
@@ -58,19 +68,29 @@ class OpenAIResponsesClient:
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout_seconds=self.timeout_seconds,
         )
-        self.record_usage(response)
-        return parse_json_object(extract_responses_text(response))
+        call_usage = self.record_usage(response)
+        return parse_json_object(extract_responses_text(response)), call_usage
 
-    def record_usage(self, response: dict[str, Any]) -> None:
+    def record_usage(self, response: dict[str, Any]) -> dict[str, Any]:
         input_tokens, output_tokens, total_tokens = usage_from_response(response)
-        self.usage_summary.add_call(
-            model=self.model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            total_tokens=total_tokens,
-            cost_usd=cost_for_tokens(input_tokens, output_tokens, self.pricing),
-            pricing=self.pricing,
-        )
+        cost_usd = cost_for_tokens(input_tokens, output_tokens, self.pricing)
+        # Mutations are serialized so concurrent batched extraction calls accumulate safely.
+        with self._usage_lock:
+            self.usage_summary.add_call(
+                model=self.model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                cost_usd=cost_usd,
+                pricing=self.pricing,
+            )
+        return {
+            "calls": 1,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens if total_tokens is not None else input_tokens + output_tokens,
+            "total_cost_usd": round(cost_usd, 10),
+        }
 
 
 class OpenAICompatibleChatClient:
@@ -90,10 +110,15 @@ class OpenAICompatibleChatClient:
         self.timeout_seconds = timeout_seconds
         self.usage_summary = UsageSummary()
         self.pricing = pricing_from_env()
+        self._usage_lock = threading.Lock()
         if not self.api_key:
             raise LLMError("OPENAI_API_KEY is required for openai-compatible extractor mode.")
 
     def complete_json(self, *, system: str, user: str) -> dict[str, Any]:
+        payload, _ = self.complete_json_with_usage(system=system, user=user)
+        return payload
+
+    def complete_json_with_usage(self, *, system: str, user: str) -> tuple[dict[str, Any], dict[str, Any]]:
         payload = {
             "model": self.model,
             "messages": [
@@ -108,23 +133,32 @@ class OpenAICompatibleChatClient:
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout_seconds=self.timeout_seconds,
         )
-        self.record_usage(response)
+        call_usage = self.record_usage(response)
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"Chat completions response missing message content: {response}") from exc
-        return parse_json_object(str(content))
+        return parse_json_object(str(content)), call_usage
 
-    def record_usage(self, response: dict[str, Any]) -> None:
+    def record_usage(self, response: dict[str, Any]) -> dict[str, Any]:
         input_tokens, output_tokens, total_tokens = usage_from_response(response)
-        self.usage_summary.add_call(
-            model=self.model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            total_tokens=total_tokens,
-            cost_usd=cost_for_tokens(input_tokens, output_tokens, self.pricing),
-            pricing=self.pricing,
-        )
+        cost_usd = cost_for_tokens(input_tokens, output_tokens, self.pricing)
+        with self._usage_lock:
+            self.usage_summary.add_call(
+                model=self.model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                cost_usd=cost_usd,
+                pricing=self.pricing,
+            )
+        return {
+            "calls": 1,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens if total_tokens is not None else input_tokens + output_tokens,
+            "total_cost_usd": round(cost_usd, 10),
+        }
 
 
 def extract_responses_text(response: dict[str, Any]) -> str:

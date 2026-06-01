@@ -43,7 +43,7 @@ def prompt_hash(system: str, user: str) -> str:
 
 QUERY_PLANNER_PROMPT = PromptSpec(
     prompt_id="qu.query_planner",
-    version="2026-05-29.1",
+    version="2026-06-01.1",
     role="planner",
     system="""You are a query-understanding planner for a call-record silver dataset.
 Return only a JSON object with this shape:
@@ -57,7 +57,7 @@ Return only a JSON object with this shape:
   "steps": [
     {
       "tool": "bm25_search_chunks | embedding_search_chunks | search_chunks | query_silver | aggregate_silver | fetch_chunks | review_schema_gaps",
-      "arguments": {"query": "optional query", "filters": {}, "group_by": "optional field", "limit": 10},
+      "arguments": {"query": "optional query", "queries": ["optional parallel subqueries"], "filters": {}, "group_by": "optional field", "limit": 10},
       "purpose": "why this tool step is needed"
     }
   ],
@@ -84,6 +84,8 @@ Rules:
 - Use both bm25_search_chunks and embedding_search_chunks when lexical precision and semantic recall are both useful; the agent will inspect both tool results rather than relying on static score fusion.
 - Prefer at least two diverse retrieval attempts for search-heavy queries when both lexical and semantic evidence matter.
 - Keep retrieval queries diverse: do not repeat the same tool/query pair, and change either the tool or the query intent between attempts.
+- To decompose one request into independent retrievals, set "queries" on a single search step: each subquery runs in parallel and results are merged (map-reduce). This expresses difference-style requests like "looks like X but is missing Y" as two subqueries in one step.
+- Fan out with a thick prompt over a small batch of focused subqueries (roughly 20 max); one tiny subquery over a huge batch is an anti-pattern. Keep subqueries diverse from each other, not near-duplicates.
 - Only use field names and allowed values from the provided catalog.
 - For list fields, the filter value should be one allowed item, not the whole list, unless the user asks for multiple values.
 - For boolean fields, use true or false.
@@ -136,7 +138,7 @@ Rules:
 
 RETRIEVAL_CONTROLLER_PROMPT = PromptSpec(
     prompt_id="qu.retrieval_controller",
-    version="2026-05-29.1",
+    version="2026-06-01.1",
     role="retrieval_subagent",
     system="""You are an agentic retrieval subagent for call-record analysis.
 Return only JSON:
@@ -144,6 +146,7 @@ Return only JSON:
   "action": "search" | "stop",
   "tool": "bm25_search_chunks | embedding_search_chunks | search_chunks",
   "query": "diverse next retrieval query",
+  "queries": ["optional parallel subqueries; use instead of query to fan out one step"],
   "limit": 5,
   "reason": "short rationale",
   "failure_reason": "why the current evidence is insufficient, if any"
@@ -155,6 +158,7 @@ Rules:
 - Use embeddings for paraphrases, abstraction, synonyms, and likely wording mismatch.
 - Do not repeat the same query/tool pair. Avoid queries with nearly identical terms to prior queries for the same tool.
 - Prefer one focused next search step over broad multi-intent queries.
+- When a single decision needs several independent retrievals (e.g. comparing two concepts), set "queries" to fan them out in parallel rather than emitting them one at a time. Keep the batch small and focused (roughly 20 max) and keep the subqueries diverse from each other.
 """,
 )
 

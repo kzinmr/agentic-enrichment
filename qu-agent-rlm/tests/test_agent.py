@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 workspace = Path(__file__).resolve().parents[2]
@@ -294,6 +296,41 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertIn("llm_rerank:fake-reranker", trace_tools)
             self.assertEqual(result["records"][0]["call_id"], "call-001")
             self.assertGreaterEqual(len(result["search_diagnostics"]["calls"]), 2)
+
+    def test_search_step_fans_out_subqueries_in_parallel_and_merges(self) -> None:
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "corpus"
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            agent = ConcurrencyProbeAgent(
+                SilverCorpus.from_dir(output),
+                planner=FanoutSearchPlanner(
+                    [
+                        "security review access controls",
+                        "founder led sales calls",
+                        "founder led sales calls",  # duplicate collapses before execution
+                    ]
+                ),
+            )
+
+            result = agent.answer("Find security and founder-led calls.", limit=10)
+
+            self.assertEqual(result["plan"]["operation"], "search")
+            queries = [call["query"] for call in result["search_diagnostics"]["calls"]]
+            self.assertIn("security review access controls", queries)
+            self.assertIn("founder led sales calls", queries)
+            # The duplicate subquery is dropped, so exactly two fan-out searches run.
+            self.assertEqual(queries.count("founder led sales calls"), 1)
+            fanout_events = [event for event in result["trace"] if event["arguments"].get("fanout")]
+            self.assertTrue(fanout_events)
+            self.assertEqual(fanout_events[0]["arguments"]["fanout"], 2)
+            record_ids = [record["call_id"] for record in result["records"]]
+            self.assertEqual(len(record_ids), len(set(record_ids)))  # merged + deduped
+            self.assertIn("call-001", record_ids)
+            self.assertIn("call-005", record_ids)
+            self.assertGreaterEqual(agent.max_active, 2)  # subqueries ran concurrently
 
     def test_agent_accepts_specialized_retrieval_subagent(self) -> None:
         sample = workspace / "data" / "sample_calls.jsonl"
@@ -626,6 +663,49 @@ class EmbeddingSearchPlanner:
                 QueryToolStep(tool="fetch_chunks", arguments={"limit": 1}, purpose="Fetch evidence."),
             ],
         )
+
+
+class FanoutSearchPlanner:
+    name = "fanout-static"
+
+    def __init__(self, queries):
+        self.queries = queries
+
+    def plan(self, query, catalog):
+        del catalog
+        return QueryPlan(
+            operation="search",
+            ranking_query=query,
+            planner=self.name,
+            reasoning="Fan-out test planner.",
+            steps=[
+                QueryToolStep(
+                    tool="bm25_search_chunks",
+                    arguments={"queries": self.queries, "limit": 5, "promote_records": True},
+                    purpose="Parallel subquery fan-out.",
+                ),
+                QueryToolStep(tool="fetch_chunks", arguments={"limit": 5}, purpose="Fetch evidence."),
+            ],
+        )
+
+
+class ConcurrencyProbeAgent(QueryUnderstandingAgent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._probe_lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def search_with_tool(self, tool, query, *, filters, limit):
+        with self._probe_lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(0.02)
+            return super().search_with_tool(tool, query, filters=filters, limit=limit)
+        finally:
+            with self._probe_lock:
+                self.active -= 1
 
 
 class FakeEmbeddingClient:
