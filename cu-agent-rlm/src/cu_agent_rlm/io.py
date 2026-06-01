@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import CallRecord, ContentUnderstandingArtifact, TranscriptTurn
+from .replay import redact_for_replay
 
 
 TRANSCRIPT_KEYS = ("transcript", "transcript_text", "text", "content", "transcription_summary")
@@ -145,6 +146,11 @@ def write_artifact(artifact: ContentUnderstandingArtifact, output_dir: Path) -> 
     write_jsonl(output_dir / "field_extractions.jsonl", artifact.extractions)
     write_jsonl(output_dir / "silver_calls.jsonl", artifact.silver_calls)
     write_jsonl(output_dir / "rlm_trace.jsonl", artifact.trace)
+    # Replay-safe trace: raw transcript text (if any future event carries it) stripped by default.
+    write_jsonl(
+        output_dir / "rlm_trace.replay.jsonl",
+        [redact_for_replay(asdict(event)) for event in artifact.trace],
+    )
 
 
 def write_jsonl(path: Path, records: list[object]) -> None:

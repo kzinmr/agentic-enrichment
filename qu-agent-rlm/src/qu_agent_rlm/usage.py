@@ -109,6 +109,24 @@ def pricing_from_env() -> dict[str, Any]:
     }
 
 
+def budget_unpriced_warning(max_budget_usd: float | None) -> str | None:
+    """Warn when a USD budget is set but no pricing is configured.
+
+    Without OPENAI_INPUT_USD_PER_MTOK / OPENAI_OUTPUT_USD_PER_MTOK the per-call cost stays
+    0.0, so the ``max_budget_usd`` guardrail can never trigger. Surfacing this prevents a
+    silent no-op from being mistaken for "the run stayed under budget".
+    """
+    if max_budget_usd is None:
+        return None
+    if pricing_from_env().get("source") == "unpriced":
+        return (
+            f"--max-budget-usd={max_budget_usd} is set but no token pricing is configured "
+            "(set OPENAI_INPUT_USD_PER_MTOK and OPENAI_OUTPUT_USD_PER_MTOK). "
+            "Cost stays 0.0, so the budget guardrail will never trigger."
+        )
+    return None
+
+
 def cost_for_tokens(input_tokens: int, output_tokens: int, pricing: dict[str, Any]) -> float:
     input_rate = pricing.get("input_usd_per_mtok")
     output_rate = pricing.get("output_usd_per_mtok")
@@ -123,6 +141,19 @@ def usage_summary_from_components(*components: object) -> dict[str, Any]:
     for component in components:
         _merge_component_usage(summary, component, seen)
     return summary.to_dict()
+
+
+def usage_delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "calls": int(after.get("total_calls", 0) or 0) - int(before.get("total_calls", 0) or 0),
+        "input_tokens": int(after.get("input_tokens", 0) or 0) - int(before.get("input_tokens", 0) or 0),
+        "output_tokens": int(after.get("output_tokens", 0) or 0) - int(before.get("output_tokens", 0) or 0),
+        "total_tokens": int(after.get("total_tokens", 0) or 0) - int(before.get("total_tokens", 0) or 0),
+        "total_cost_usd": round(
+            float(after.get("total_cost_usd", 0.0) or 0.0) - float(before.get("total_cost_usd", 0.0) or 0.0),
+            10,
+        ),
+    }
 
 
 def _merge_component_usage(summary: UsageSummary, component: object, seen: set[int]) -> None:

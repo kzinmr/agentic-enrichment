@@ -36,6 +36,11 @@ class ToolEvent:
     tool: str
     arguments: dict[str, Any]
     result_summary: str
+    latency_ms: float | None = None
+    tokens: dict[str, Any] | None = None
+    fallback_reason: str | None = None
+    prompt_hash: str | None = None
+    validation_result: str | None = None
 
 
 class SilverCorpus:

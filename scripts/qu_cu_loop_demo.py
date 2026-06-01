@@ -48,7 +48,9 @@ from qu_agent_rlm.query_tasks import (
     query_source_counts,
     write_query_tasks_jsonl,
 )
+from qu_agent_rlm.replay import redact_for_replay
 from qu_agent_rlm.retrieval import DEFAULT_EMBEDDING_MODEL, OpenAIEmbeddingClient
+from qu_agent_rlm.usage import budget_unpriced_warning
 from qu_agent_rlm.retrieval_agent import AgenticRetrievalSubAgent, SearchExecutionPolicy
 
 
@@ -97,6 +99,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-search-calls", type=int, default=2)
     parser.add_argument("--max-search-iterations", type=int, default=2)
     parser.add_argument("--query-diversity-threshold", type=float, default=0.8)
+    parser.add_argument("--max-errors", type=int, default=3)
+    parser.add_argument("--max-budget-usd", type=float, default=None)
+    parser.add_argument("--max-timeout-seconds", type=float, default=None)
     parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--embedding-cache", type=Path, default=None)
     parser.add_argument("--llm-base-url", default=None)
@@ -109,12 +114,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-timeout-seconds", type=int, default=None)
     parser.add_argument("--no-tui", action="store_true", help="Disable the terminal UI and print JSON only.")
     parser.add_argument("--print-json", action="store_true", help="Print the raw summary JSON after the TUI.")
+    parser.add_argument(
+        "--no-replay",
+        action="store_true",
+        help="Do not write redacted *.replay.json artifacts (raw transcript snippets stripped) next to QU answers.",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
     configure_llm_args(args)
+    budget_warning = budget_unpriced_warning(args.max_budget_usd)
+    if budget_warning:
+        print(f"WARNING: {budget_warning}", file=sys.stderr)
     args.output_root.mkdir(parents=True, exist_ok=True)
     loop_id = f"qu-cu-loop-{uuid4().hex[:12]}"
     tui = DemoTUI(title="QU-CU Improvement Loop", enabled=not args.no_tui)
@@ -192,7 +205,7 @@ def main() -> int:
             output_dir=baseline_answers_dir,
         )
     if baseline_answers:
-        write_json(baseline_answer_path, baseline_answers[0])
+        write_answer_artifact(baseline_answer_path, baseline_answers[0], write_replay=not args.no_replay)
     tui.show_answers("Baseline QU", baseline_answers, baseline_answers_dir)
     orchestration_events.extend(
         query_answer_events(
@@ -261,7 +274,7 @@ def main() -> int:
             output_dir=refined_answers_dir,
         )
     if refined_answers:
-        write_json(refined_answer_path, refined_answers[0])
+        write_answer_artifact(refined_answer_path, refined_answers[0], write_replay=not args.no_replay)
     tui.show_answers("Refined QU", refined_answers, refined_answers_dir)
     orchestration_events.extend(
         query_answer_events(
@@ -344,6 +357,9 @@ def run_cu(
         schema_inducer=build_cu_schema_inducer(args),
         field_extractor=build_cu_field_extractor(args),
         feedback_input=feedback_input,
+        max_errors=args.max_errors,
+        max_budget_usd=args.max_budget_usd,
+        max_timeout_seconds=args.max_timeout_seconds,
     )
 
 
@@ -470,7 +486,11 @@ def answer_tasks_with_qu(
         answer = agent.answer(str(task["query"]), limit=limit)
         answer["query_task"] = task
         answers.append(answer)
-        write_json(output_dir / f"{safe_file_stem(str(task['task_id']))}.json", answer)
+        write_answer_artifact(
+            output_dir / f"{safe_file_stem(str(task['task_id']))}.json",
+            answer,
+            write_replay=not args.no_replay,
+        )
     return answers
 
 
@@ -500,6 +520,9 @@ def build_qu_agent(args: argparse.Namespace, *, corpus_dir: Path) -> QueryUnders
         retrieval_mode=args.retrieval_mode,
         retrieval_subagent=retrieval_subagent,
         answer_judge=LLMAnswerJudge(build_qu_judge_client(args), fallback=HeuristicAnswerJudge()),
+        max_errors=args.max_errors,
+        max_budget_usd=args.max_budget_usd,
+        max_timeout_seconds=args.max_timeout_seconds,
     )
 
 
@@ -667,6 +690,12 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def write_answer_artifact(path: Path, answer: dict[str, Any], *, write_replay: bool) -> None:
+    write_json(path, answer)
+    if write_replay:
+        write_json(path.with_suffix(".replay.json"), redact_for_replay(answer))
+
+
 def field_names(catalog: dict[str, Any]) -> set[str]:
     return {field["name"] for field in catalog.get("fields", [])}
 
@@ -722,6 +751,7 @@ def cu_metrics(artifact: Any) -> dict[str, Any]:
         "llm_output_tokens": usage.get("output_tokens", 0),
         "llm_total_tokens": usage.get("total_tokens", 0),
         "llm_total_cost_usd": usage.get("total_cost_usd", 0.0),
+        "llm_cost_basis": usage.get("pricing", {}).get("source", "unpriced"),
     }
 
 
@@ -744,6 +774,7 @@ def qu_metrics(answer: dict[str, Any]) -> dict[str, Any]:
         "llm_output_tokens": usage.get("output_tokens", 0),
         "llm_total_tokens": usage.get("total_tokens", 0),
         "llm_total_cost_usd": usage.get("total_cost_usd", 0.0),
+        "llm_cost_basis": usage.get("pricing", {}).get("source", "unpriced"),
     }
 
 

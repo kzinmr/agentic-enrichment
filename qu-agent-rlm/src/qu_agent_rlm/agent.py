@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import time
 from typing import Any
 
 from .corpus import SilverCorpus, ToolEvent
@@ -16,7 +17,7 @@ from .planner import (
 )
 from .retrieval import english_tokenize
 from .retrieval_agent import AgenticRetrievalSubAgent, RetrievalSubAgent, SearchExecutionPolicy
-from .usage import usage_summary_from_components
+from .usage import usage_delta, usage_summary_from_components
 
 
 SEARCH_TOOL_NAMES = {"search_chunks", "bm25_search_chunks", "embedding_search_chunks"}
@@ -34,6 +35,9 @@ class QueryUnderstandingAgent:
         retrieval_subagent: RetrievalSubAgent | None = None,
         answer_judge: AnswerJudge | None = None,
         search_policy: SearchExecutionPolicy | None = None,
+        max_errors: int = 3,
+        max_budget_usd: float | None = None,
+        max_timeout_seconds: float | None = None,
     ) -> None:
         self.corpus = corpus
         # Bare constructor defaults are for smoke tests; CLI/demo callers inject LLM-first components.
@@ -43,6 +47,9 @@ class QueryUnderstandingAgent:
         self.reranker = reranker
         self.answer_judge = answer_judge or HeuristicAnswerJudge()
         self.search_policy = search_policy or SearchExecutionPolicy()
+        self.max_errors = max_errors
+        self.max_budget_usd = max_budget_usd
+        self.max_timeout_seconds = max_timeout_seconds
         self.retrieval_subagent = retrieval_subagent or AgenticRetrievalSubAgent(
             controller=search_controller,
             reranker=reranker,
@@ -51,7 +58,15 @@ class QueryUnderstandingAgent:
 
     def answer(self, query: str, *, limit: int = 10) -> dict[str, Any]:
         trace: list[ToolEvent] = []
+        guardrails = GuardrailState(
+            max_errors=self.max_errors,
+            max_budget_usd=self.max_budget_usd,
+            max_timeout_seconds=self.max_timeout_seconds,
+        )
+        before_usage = self.usage_summary()
+        plan_started = time.perf_counter()
         plan = self.planner.plan(query, self.corpus.catalog)
+        plan_tokens = usage_delta(self.usage_summary(), before_usage)
         if not plan.steps:
             plan.steps = default_steps_for_plan(plan)
         trace.append(
@@ -71,6 +86,10 @@ class QueryUnderstandingAgent:
                     f"operation={plan.operation} filters={plan.filters} "
                     f"group_by={plan.group_by} steps={len(plan.steps)} reasoning={plan.reasoning}"
                 ),
+                latency_ms=elapsed_ms(plan_started),
+                tokens=plan_tokens,
+                prompt_hash=prompt_hash_from_component(self.planner),
+                validation_result="ok",
             )
         )
 
@@ -87,8 +106,36 @@ class QueryUnderstandingAgent:
             "reranker_prompt": {},
         }
         for step in plan.steps:
-            self.execute_step(step, query=query, plan=plan, state=state, limit=limit, trace=trace)
+            stop_reason = guardrails.stop_reason(self.usage_summary())
+            if stop_reason:
+                append_guardrail_trace(trace, stop_reason)
+                break
+            try:
+                step_started = time.perf_counter()
+                trace_len_before = len(trace)
+                self.execute_step(step, query=query, plan=plan, state=state, limit=limit, trace=trace)
+                annotate_new_events(trace, trace_len_before, latency_ms=elapsed_ms(step_started), tokens={})
+                guardrails.record_success()
+            except (ValueError, TypeError) as exc:
+                guardrails.record_error()
+                trace.append(
+                    ToolEvent(
+                        step=len(trace) + 1,
+                        tool="execute_step:error",
+                        arguments={"tool": step.tool, "purpose": step.purpose},
+                        result_summary=str(exc)[:240],
+                        fallback_reason=str(exc)[:240],
+                        validation_result="error",
+                    )
+                )
+                if guardrails.stop_reason(self.usage_summary()):
+                    append_guardrail_trace(trace, guardrails.stop_reason_value or "max_errors_exceeded")
+                    break
             if step.tool in SEARCH_TOOL_NAMES:
+                before_usage = self.usage_summary()
+                retrieval_started = time.perf_counter()
+                trace_len_before = len(trace)
+                error_count_before = trace_error_count(trace)
                 self.retrieval_subagent.after_search_step(
                     query=query,
                     plan=plan,
@@ -99,14 +146,48 @@ class QueryUnderstandingAgent:
                     available_tools=self.available_search_tools(),
                     trace_tool_name=self.trace_tool_name,
                 )
+                retrieval_tokens = usage_delta(self.usage_summary(), before_usage)
+                annotate_new_events(
+                    trace,
+                    trace_len_before,
+                    latency_ms=elapsed_ms(retrieval_started),
+                    tokens=retrieval_tokens,
+                    prompt_hash=prompt_hash_from_component(self.retrieval_subagent),
+                )
+                if trace_error_count(trace) > error_count_before:
+                    guardrails.record_error()
+                else:
+                    guardrails.record_success()
+                stop_reason = guardrails.stop_reason(self.usage_summary())
+                if stop_reason:
+                    append_guardrail_trace(trace, stop_reason)
+                    break
 
-        self.retrieval_subagent.finalize(query=query, plan=plan, state=state, limit=limit, trace=trace)
+        if not guardrails.stopped:
+            before_usage = self.usage_summary()
+            finalize_started = time.perf_counter()
+            trace_len_before = len(trace)
+            error_count_before = trace_error_count(trace)
+            self.retrieval_subagent.finalize(query=query, plan=plan, state=state, limit=limit, trace=trace)
+            finalize_tokens = usage_delta(self.usage_summary(), before_usage)
+            annotate_new_events(
+                trace,
+                trace_len_before,
+                latency_ms=elapsed_ms(finalize_started),
+                tokens=finalize_tokens,
+                prompt_hash=prompt_hash_from_component(self.retrieval_subagent),
+            )
+            if trace_error_count(trace) > error_count_before:
+                guardrails.record_error()
+            stop_reason = guardrails.stop_reason(self.usage_summary())
+            if stop_reason:
+                append_guardrail_trace(trace, stop_reason)
 
         if not state["records"] and state["chunks"]:
             state["records"] = records_for_chunks(self.corpus, state["chunks"])
         elif plan.operation == "search" and state["chunks"]:
             state["records"] = records_for_chunks(self.corpus, state["chunks"])
-        if plan.retrieve_evidence and not state["evidence"]:
+        if plan.retrieve_evidence and not state["evidence"] and not guardrails.stopped:
             self.execute_step(
                 QueryToolStep(tool="fetch_chunks", arguments={"limit": 8}, purpose="Fetch fallback evidence."),
                 query=query,
@@ -121,6 +202,8 @@ class QueryUnderstandingAgent:
         evidence = state["evidence"]
         column_requests = merge_column_requests(state["column_requests"])
         answer = aggregate_answer(plan, aggregation) if plan.operation == "aggregate" else search_answer(records, plan)
+        before_usage = self.usage_summary()
+        judge_started = time.perf_counter()
         judgement = self.answer_judge.judge(
             query=query,
             plan=plan,
@@ -134,6 +217,9 @@ class QueryUnderstandingAgent:
             column_requests=column_requests,
             catalog=self.corpus.catalog,
         )
+        judge_tokens = usage_delta(self.usage_summary(), before_usage)
+        if guardrails.stopped:
+            judgement = judgement_with_guardrail(judgement, guardrails.stop_reason_value or "guardrail_stop")
         trace.append(
             ToolEvent(
                 step=len(trace) + 1,
@@ -145,6 +231,10 @@ class QueryUnderstandingAgent:
                     "needs_cu_feedback": judgement.get("needs_cu_feedback"),
                 },
                 result_summary=str(judgement.get("rationale", ""))[:240],
+                latency_ms=elapsed_ms(judge_started),
+                tokens=judge_tokens,
+                prompt_hash=prompt_hash_from_component(self.answer_judge),
+                validation_result="ok",
             )
         )
         return result_payload(
@@ -162,13 +252,18 @@ class QueryUnderstandingAgent:
             judgement=judgement,
             retrieval_subagent=self.retrieval_subagent.name,
             prompt_state=self.prompt_state(judgement, state),
-            usage_summary=usage_summary_from_components(
-                self.planner,
-                self.search_controller,
-                self.reranker,
-                self.retrieval_subagent,
-                self.answer_judge,
-            ),
+            usage_summary=self.usage_summary(),
+            guardrails=guardrails.to_dict(),
+            best_partial_answer=best_partial_answer(records, aggregation, evidence),
+        )
+
+    def usage_summary(self) -> dict[str, Any]:
+        return usage_summary_from_components(
+            self.planner,
+            self.search_controller,
+            self.reranker,
+            self.retrieval_subagent,
+            self.answer_judge,
         )
 
     def prompt_state(self, judgement: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
@@ -381,6 +476,8 @@ def result_payload(
     retrieval_subagent: str,
     prompt_state: dict[str, Any],
     usage_summary: dict[str, Any],
+    guardrails: dict[str, Any],
+    best_partial_answer: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "query": query,
@@ -395,8 +492,138 @@ def result_payload(
         "judgement": judgement,
         "prompt_state": prompt_state,
         "usage_summary": usage_summary,
+        "guardrails": guardrails,
+        "best_partial_answer": best_partial_answer,
         "trace": [asdict(event) for event in trace],
     }
+
+
+class GuardrailState:
+    def __init__(
+        self,
+        *,
+        max_errors: int,
+        max_budget_usd: float | None,
+        max_timeout_seconds: float | None,
+    ) -> None:
+        self.max_errors = max_errors
+        self.max_budget_usd = max_budget_usd
+        self.max_timeout_seconds = max_timeout_seconds
+        self.started_at = time.perf_counter()
+        self.consecutive_errors = 0
+        self.stop_reason_value: str | None = None
+
+    @property
+    def stopped(self) -> bool:
+        return self.stop_reason_value is not None
+
+    def record_success(self) -> None:
+        self.consecutive_errors = 0
+
+    def record_error(self) -> None:
+        self.consecutive_errors += 1
+
+    def stop_reason(self, usage_summary: dict[str, Any]) -> str | None:
+        if self.stop_reason_value is not None:
+            return self.stop_reason_value
+        if self.max_errors > 0 and self.consecutive_errors >= self.max_errors:
+            self.stop_reason_value = "max_errors_exceeded"
+        elif self.max_budget_usd is not None and float(usage_summary.get("total_cost_usd", 0.0) or 0.0) >= self.max_budget_usd:
+            self.stop_reason_value = "budget_exceeded"
+        elif self.max_timeout_seconds is not None and time.perf_counter() - self.started_at >= self.max_timeout_seconds:
+            self.stop_reason_value = "timeout"
+        return self.stop_reason_value
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_errors": self.max_errors,
+            "max_budget_usd": self.max_budget_usd,
+            "max_timeout_seconds": self.max_timeout_seconds,
+            "consecutive_errors": self.consecutive_errors,
+            "stopped": self.stopped,
+            "stop_reason": self.stop_reason_value,
+        }
+
+
+def append_guardrail_trace(trace: list[ToolEvent], reason: str) -> None:
+    trace.append(
+        ToolEvent(
+            step=len(trace) + 1,
+            tool="guardrail_stop",
+            arguments={"reason": reason},
+            result_summary=f"Stopped execution because {reason}. Returning best partial answer.",
+            fallback_reason=reason,
+            validation_result="stopped",
+        )
+    )
+
+
+def annotate_new_events(
+    trace: list[ToolEvent],
+    start_index: int,
+    *,
+    latency_ms: float,
+    tokens: dict[str, Any],
+    prompt_hash: str | None = None,
+) -> None:
+    for event in trace[start_index:]:
+        if event.latency_ms is None:
+            event.latency_ms = latency_ms
+        if event.tokens is None:
+            event.tokens = tokens
+        elif not event.tokens and tokens:
+            event.tokens = tokens
+        if event.prompt_hash is None:
+            event.prompt_hash = prompt_hash
+        if event.validation_result is None:
+            event.validation_result = "ok"
+
+
+def trace_error_count(trace: list[ToolEvent]) -> int:
+    return sum(1 for event in trace if event.tool.endswith(":error") or event.validation_result == "error")
+
+
+def judgement_with_guardrail(judgement: dict[str, Any], reason: str) -> dict[str, Any]:
+    updated = dict(judgement)
+    modes = list(updated.get("failure_modes", [])) if isinstance(updated.get("failure_modes"), list) else []
+    if reason not in modes:
+        modes.append(reason)
+    updated["failure_modes"] = modes
+    updated["success"] = False
+    updated["needs_cu_feedback"] = True
+    rationale = str(updated.get("rationale", "")).strip()
+    updated["rationale"] = f"{rationale} Guardrail stopped execution: {reason}.".strip()
+    return updated
+
+
+def best_partial_answer(
+    records: list[dict[str, Any]],
+    aggregation: dict[str, int],
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "record_count": len(records),
+        "aggregation_group_count": len(aggregation),
+        "evidence_count": len(evidence),
+        "record_ids": [record.get("call_id") for record in records[:10]],
+    }
+
+
+def prompt_hash_from_component(component: object) -> str | None:
+    prompt = getattr(component, "last_prompt", None)
+    if prompt is None:
+        prompt = getattr(component, "last_controller_prompt", None) or getattr(component, "last_reranker_prompt", None)
+    if isinstance(prompt, dict):
+        value = prompt.get("prompt_hash")
+        return str(value) if value else None
+    nested = getattr(component, "llm", None)
+    if nested is not None and nested is not component:
+        return prompt_hash_from_component(nested)
+    return None
+
+
+def elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 3)
 
 
 def compact_record(record: dict[str, Any]) -> dict[str, Any]:

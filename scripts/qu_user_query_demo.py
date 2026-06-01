@@ -31,7 +31,9 @@ from qu_agent_rlm.env import default_env_file, load_env_file
 from qu_agent_rlm.llm import DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_MODEL
 from qu_agent_rlm.prompt_repair import append_prompt_repair_requests
 from qu_agent_rlm.query_tasks import load_query_tasks, normalize_query_task, write_query_tasks_jsonl
+from qu_agent_rlm.replay import redact_for_replay
 from qu_agent_rlm.retrieval import DEFAULT_EMBEDDING_MODEL
+from qu_agent_rlm.usage import budget_unpriced_warning
 
 
 DEFAULT_USER_QUERIES = [
@@ -106,6 +108,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-search-calls", type=int, default=1)
     parser.add_argument("--max-search-iterations", type=int, default=0)
     parser.add_argument("--query-diversity-threshold", type=float, default=0.8)
+    parser.add_argument("--max-errors", type=int, default=3)
+    parser.add_argument("--max-budget-usd", type=float, default=None)
+    parser.add_argument("--max-timeout-seconds", type=float, default=None)
     parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--embedding-cache", type=Path, default=None)
     parser.add_argument(
@@ -124,12 +129,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-prompt-repair-output", action="store_true")
     parser.add_argument("--no-tui", action="store_true", help="Disable the terminal UI and print JSON only.")
     parser.add_argument("--print-json", action="store_true", help="Print the raw summary JSON after the TUI.")
+    parser.add_argument(
+        "--no-replay",
+        action="store_true",
+        help="Do not write redacted *.replay.json artifacts (raw transcript snippets stripped) next to QU answers.",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
     configure_llm_args(args)
+    budget_warning = budget_unpriced_warning(args.max_budget_usd)
+    if budget_warning:
+        print(f"WARNING: {budget_warning}", file=sys.stderr)
     corpus_dir = resolve_corpus_dir(args)
     output_dir = args.output_dir or args.loop_output_root / "05_user_queries" / args.stage
     tui = DemoTUI(title="QU User Query Demo", enabled=not args.no_tui)
@@ -189,6 +202,8 @@ def main() -> int:
             answer["agent_context"] = agent_context
             answer_path = answers_dir / f"{safe_file_stem(str(task['task_id']))}.json"
             write_json(answer_path, answer)
+            if not args.no_replay:
+                write_json(answer_path.with_suffix(".replay.json"), redact_for_replay(answer))
             answers.append(answer)
             if feedback_output:
                 append_feedback(feedback_output, answer, corpus_path=corpus_dir)
@@ -267,6 +282,9 @@ def build_agent(args: argparse.Namespace, *, corpus_dir: Path) -> QueryUnderstan
         retrieval_mode=args.retrieval_mode,
         retrieval_subagent=retrieval_subagent,
         answer_judge=answer_judge,
+        max_errors=args.max_errors,
+        max_budget_usd=args.max_budget_usd,
+        max_timeout_seconds=args.max_timeout_seconds,
     )
 
 
@@ -432,6 +450,7 @@ def answer_metrics(answer: dict[str, Any]) -> dict[str, Any]:
         "llm_output_tokens": usage.get("output_tokens", 0),
         "llm_total_tokens": usage.get("total_tokens", 0),
         "llm_total_cost_usd": usage.get("total_cost_usd", 0.0),
+        "llm_cost_basis": usage.get("pricing", {}).get("source", "unpriced"),
     }
 
 

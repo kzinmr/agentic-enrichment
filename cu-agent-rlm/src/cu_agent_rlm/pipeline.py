@@ -4,11 +4,12 @@ from collections import Counter
 import hashlib
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
 from .chunking import build_chunks
-from .extraction import FieldExtractor, HeuristicFieldExtractor
+from .extraction import ExtractionError, FieldExtractor, HeuristicFieldExtractor
 from .feedback import (
     FeedbackAwareSchemaInducer,
     FeedbackSummary,
@@ -29,7 +30,7 @@ from .models import (
     TraceEvent,
 )
 from .schema import HeuristicSchemaInducer, SchemaInducer
-from .usage import usage_summary_from_components
+from .usage import usage_delta, usage_summary_from_components
 
 
 def run_content_understanding(
@@ -41,6 +42,9 @@ def run_content_understanding(
     field_extractor: FieldExtractor | None = None,
     schema_inducer: SchemaInducer | None = None,
     feedback_input: Path | None = None,
+    max_errors: int = 3,
+    max_budget_usd: float | None = None,
+    max_timeout_seconds: float | None = None,
 ) -> ContentUnderstandingArtifact:
     calls = load_calls(input_path)
     feedback = summarize_feedback(load_feedback_jsonl(feedback_input), source_path=feedback_input) if feedback_input else empty_feedback_summary()
@@ -51,6 +55,9 @@ def run_content_understanding(
         field_extractor=field_extractor,
         schema_inducer=schema_inducer,
         feedback=feedback,
+        max_errors=max_errors,
+        max_budget_usd=max_budget_usd,
+        max_timeout_seconds=max_timeout_seconds,
     )
     write_artifact(artifact, output_dir)
     return artifact
@@ -64,8 +71,12 @@ def analyze_calls(
     field_extractor: FieldExtractor | None = None,
     schema_inducer: SchemaInducer | None = None,
     feedback: FeedbackSummary | None = None,
+    max_errors: int = 3,
+    max_budget_usd: float | None = None,
+    max_timeout_seconds: float | None = None,
 ) -> ContentUnderstandingArtifact:
     trace = TraceBuilder()
+    guardrails = GuardrailState(max_errors=max_errors, max_budget_usd=max_budget_usd, max_timeout_seconds=max_timeout_seconds)
     # Bare API defaults are for smoke tests; CLI/demo callers inject LLM-first components.
     extractor = field_extractor or HeuristicFieldExtractor()
     feedback = feedback or empty_feedback_summary()
@@ -73,7 +84,10 @@ def analyze_calls(
     inducer = FeedbackAwareSchemaInducer(base_inducer, feedback) if feedback.has_requests else base_inducer
     chunks = build_chunks(calls, max_chars=max_chunk_chars)
     chunks_by_call = group_chunks_by_call(chunks)
+    before_usage = usage_summary_from_components(inducer)
+    schema_started = time.perf_counter()
     schema_specs = inducer.induce_schema(calls, chunks)
+    schema_usage = usage_delta(usage_summary_from_components(inducer), before_usage)
     manifest = build_manifest(
         calls,
         chunks,
@@ -101,6 +115,10 @@ def analyze_calls(
         "induce_schema",
         {"inducer": inducer.name, "field_count": len(schema_specs)},
         "induced silver schema from call content and manifest",
+        latency_ms=elapsed_ms(schema_started),
+        tokens=schema_usage,
+        prompt_hash=prompt_hash_from_component(inducer),
+        validation_result="ok",
     )
 
     for spec in schema_specs:
@@ -114,7 +132,33 @@ def analyze_calls(
 
     extractions: list[FieldExtraction] = []
     for call in calls:
-        call_extractions = extractor.extract_call_fields(call, chunks_by_call.get(call.call_id, []), schema_specs)
+        stop_reason = guardrails.stop_reason(usage_summary_from_components(inducer, extractor))
+        if stop_reason:
+            trace.add(
+                "root",
+                "guardrail_stop",
+                {"reason": stop_reason, "call_id": call.call_id},
+                f"stopped with {len(extractions)} extracted field rows",
+                fallback_reason=stop_reason,
+                validation_result="stopped",
+            )
+            break
+        before_usage = usage_summary_from_components(extractor)
+        extraction_started = time.perf_counter()
+        fallback_reason = None
+        validation_result = "ok"
+        try:
+            call_extractions = extractor.extract_call_fields(call, chunks_by_call.get(call.call_id, []), schema_specs)
+            fallback_reason = extraction_fallback_reason(call_extractions)
+            if fallback_reason:
+                validation_result = "fallback"
+            guardrails.record_success()
+        except (ExtractionError, ValueError, TypeError) as exc:
+            call_extractions = []
+            fallback_reason = str(exc)[:240]
+            validation_result = "error"
+            guardrails.record_error()
+        extraction_usage = usage_delta(usage_summary_from_components(extractor), before_usage)
         trace.add(
             "sub-rlm",
             "extract_call_fields",
@@ -127,11 +171,34 @@ def analyze_calls(
                 f"supported_fields={sum(not item.abstained for item in call_extractions)} "
                 f"validation_errors={sum(len(item.validation_errors) for item in call_extractions)}"
             ),
+            latency_ms=elapsed_ms(extraction_started),
+            tokens=extraction_usage,
+            fallback_reason=fallback_reason,
+            prompt_hash=prompt_hash_from_component(extractor),
+            validation_result=validation_result,
         )
         extractions.extend(call_extractions)
+        stop_reason = guardrails.stop_reason(usage_summary_from_components(inducer, extractor))
+        if stop_reason:
+            trace.add(
+                "root",
+                "guardrail_stop",
+                {"reason": stop_reason, "call_id": call.call_id},
+                f"stopped with {len(extractions)} extracted field rows",
+                fallback_reason=stop_reason,
+                validation_result="stopped",
+            )
+            break
 
     manifest["prompt_state"] = prompt_state(inducer, extractor)
     manifest["usage_summary"] = usage_summary_from_components(inducer, extractor)
+    manifest["guardrails"] = guardrails.to_dict()
+    manifest["best_partial_result"] = {
+        "extracted_field_rows": len(extractions),
+        "completed_call_count": len({item.call_id for item in extractions}),
+        "stopped": guardrails.stopped,
+        "stop_reason": guardrails.stop_reason_value,
+    }
     quality_report = build_quality_report(schema_specs, extractions, total_calls=len(calls))
     promoted_specs = promoted_fields(schema_specs, quality_report)
     silver_calls = materialize_silver_calls(calls, promoted_specs, extractions)
@@ -175,7 +242,19 @@ class TraceBuilder:
     def __init__(self) -> None:
         self.events: list[TraceEvent] = []
 
-    def add(self, actor: str, tool: str, arguments: dict[str, Any], result_summary: str) -> None:
+    def add(
+        self,
+        actor: str,
+        tool: str,
+        arguments: dict[str, Any],
+        result_summary: str,
+        *,
+        latency_ms: float | None = None,
+        tokens: dict[str, Any] | None = None,
+        fallback_reason: str | None = None,
+        prompt_hash: str | None = None,
+        validation_result: str | None = None,
+    ) -> None:
         self.events.append(
             TraceEvent(
                 step=len(self.events) + 1,
@@ -183,8 +262,60 @@ class TraceBuilder:
                 tool=tool,
                 arguments=arguments,
                 result_summary=result_summary,
+                latency_ms=latency_ms,
+                tokens=tokens or {},
+                fallback_reason=fallback_reason,
+                prompt_hash=prompt_hash,
+                validation_result=validation_result,
             )
         )
+
+
+class GuardrailState:
+    def __init__(
+        self,
+        *,
+        max_errors: int,
+        max_budget_usd: float | None,
+        max_timeout_seconds: float | None,
+    ) -> None:
+        self.max_errors = max_errors
+        self.max_budget_usd = max_budget_usd
+        self.max_timeout_seconds = max_timeout_seconds
+        self.started_at = time.perf_counter()
+        self.consecutive_errors = 0
+        self.stop_reason_value: str | None = None
+
+    @property
+    def stopped(self) -> bool:
+        return self.stop_reason_value is not None
+
+    def record_success(self) -> None:
+        self.consecutive_errors = 0
+
+    def record_error(self) -> None:
+        self.consecutive_errors += 1
+
+    def stop_reason(self, usage_summary: dict[str, Any]) -> str | None:
+        if self.stop_reason_value is not None:
+            return self.stop_reason_value
+        if self.max_errors > 0 and self.consecutive_errors >= self.max_errors:
+            self.stop_reason_value = "max_errors_exceeded"
+        elif self.max_budget_usd is not None and float(usage_summary.get("total_cost_usd", 0.0) or 0.0) >= self.max_budget_usd:
+            self.stop_reason_value = "budget_exceeded"
+        elif self.max_timeout_seconds is not None and time.perf_counter() - self.started_at >= self.max_timeout_seconds:
+            self.stop_reason_value = "timeout"
+        return self.stop_reason_value
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_errors": self.max_errors,
+            "max_budget_usd": self.max_budget_usd,
+            "max_timeout_seconds": self.max_timeout_seconds,
+            "consecutive_errors": self.consecutive_errors,
+            "stopped": self.stopped,
+            "stop_reason": self.stop_reason_value,
+        }
 
 
 def build_manifest(
@@ -257,6 +388,29 @@ def prompt_state(schema_inducer: SchemaInducer, extractor: FieldExtractor) -> di
         or {},
         "field_extractor": getattr(extractor, "last_prompt", None) or {},
     }
+
+
+def prompt_hash_from_component(component: object) -> str | None:
+    prompt = getattr(component, "last_prompt", None)
+    if prompt is None:
+        base = getattr(component, "base", None)
+        prompt = getattr(base, "last_prompt", None) if base is not None else None
+    if isinstance(prompt, dict):
+        value = prompt.get("prompt_hash")
+        return str(value) if value else None
+    return None
+
+
+def extraction_fallback_reason(extractions: list[FieldExtraction]) -> str | None:
+    for extraction in extractions:
+        for error in extraction.validation_errors:
+            if error.startswith("llm_fallback:"):
+                return error
+    return None
+
+
+def elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 3)
 
 
 def dataset_id(calls: list[CallRecord]) -> str:
@@ -451,9 +605,9 @@ def build_databricks_contract(source_sql: Path | None, catalog: dict[str, Any]) 
 
 
 def observed_columns(sql_text: str) -> list[str]:
-    if not sql_text:
-        return []
-    aliases = re.findall(r"\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)", sql_text)
+    # The known call_records columns are intrinsic schema knowledge, returned even when no
+    # source SQL is supplied; any AS-aliases parsed from a provided SQL are unioned on top.
+    aliases = re.findall(r"\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)", sql_text) if sql_text else []
     explicit = [
         "calllog_id",
         "call_event_date",
