@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .chunking import build_chunks
-from .extraction import ExtractionError, FieldExtractor, HeuristicFieldExtractor
+from .extraction import FieldExtractor, HeuristicFieldExtractor, run_call_extractions
 from .feedback import (
     FeedbackAwareSchemaInducer,
     FeedbackSummary,
@@ -45,6 +45,7 @@ def run_content_understanding(
     max_errors: int = 3,
     max_budget_usd: float | None = None,
     max_timeout_seconds: float | None = None,
+    batch_max_concurrent: int = 1,
 ) -> ContentUnderstandingArtifact:
     calls = load_calls(input_path)
     feedback = summarize_feedback(load_feedback_jsonl(feedback_input), source_path=feedback_input) if feedback_input else empty_feedback_summary()
@@ -58,6 +59,7 @@ def run_content_understanding(
         max_errors=max_errors,
         max_budget_usd=max_budget_usd,
         max_timeout_seconds=max_timeout_seconds,
+        batch_max_concurrent=batch_max_concurrent,
     )
     write_artifact(artifact, output_dir)
     return artifact
@@ -74,6 +76,7 @@ def analyze_calls(
     max_errors: int = 3,
     max_budget_usd: float | None = None,
     max_timeout_seconds: float | None = None,
+    batch_max_concurrent: int = 1,
 ) -> ContentUnderstandingArtifact:
     trace = TraceBuilder()
     guardrails = GuardrailState(max_errors=max_errors, max_budget_usd=max_budget_usd, max_timeout_seconds=max_timeout_seconds)
@@ -131,63 +134,76 @@ def analyze_calls(
         )
 
     extractions: list[FieldExtraction] = []
-    for call in calls:
+    batch_size = max(1, batch_max_concurrent)
+    stopped = False
+    # Calls are processed in bounded-concurrency batches. The guardrail is checked before each
+    # batch and after each call's outcome, so the error/budget/timeout semantics match the
+    # sequential path; only calls already dispatched within the stopping batch run extra work.
+    for start in range(0, len(calls), batch_size):
         stop_reason = guardrails.stop_reason(usage_summary_from_components(inducer, extractor))
         if stop_reason:
             trace.add(
                 "root",
                 "guardrail_stop",
-                {"reason": stop_reason, "call_id": call.call_id},
+                {"reason": stop_reason, "call_id": calls[start].call_id},
                 f"stopped with {len(extractions)} extracted field rows",
                 fallback_reason=stop_reason,
                 validation_result="stopped",
             )
+            stopped = True
             break
-        before_usage = usage_summary_from_components(extractor)
-        extraction_started = time.perf_counter()
-        fallback_reason = None
-        validation_result = "ok"
-        try:
-            call_extractions = extractor.extract_call_fields(call, chunks_by_call.get(call.call_id, []), schema_specs)
-            fallback_reason = extraction_fallback_reason(call_extractions)
-            if fallback_reason:
-                validation_result = "fallback"
-            guardrails.record_success()
-        except (ExtractionError, ValueError, TypeError) as exc:
-            call_extractions = []
-            fallback_reason = str(exc)[:240]
-            validation_result = "error"
-            guardrails.record_error()
-        extraction_usage = usage_delta(usage_summary_from_components(extractor), before_usage)
-        trace.add(
-            "sub-rlm",
-            "extract_call_fields",
-            {
-                "call_id": call.call_id,
-                "field_count": len(schema_specs),
-                "extractor": extractor.name,
-            },
-            (
-                f"supported_fields={sum(not item.abstained for item in call_extractions)} "
-                f"validation_errors={sum(len(item.validation_errors) for item in call_extractions)}"
-            ),
-            latency_ms=elapsed_ms(extraction_started),
-            tokens=extraction_usage,
-            fallback_reason=fallback_reason,
-            prompt_hash=prompt_hash_from_component(extractor),
-            validation_result=validation_result,
+        batch = calls[start : start + batch_size]
+        outcomes = run_call_extractions(
+            extractor,
+            batch,
+            chunks_by_call,
+            schema_specs,
+            max_concurrent=batch_size,
         )
-        extractions.extend(call_extractions)
-        stop_reason = guardrails.stop_reason(usage_summary_from_components(inducer, extractor))
-        if stop_reason:
+        for outcome in outcomes:
+            call = outcome.call
+            if outcome.error is not None:
+                call_extractions: list[FieldExtraction] = []
+                fallback_reason: str | None = outcome.error
+                validation_result = "error"
+                guardrails.record_error()
+            else:
+                call_extractions = outcome.extractions
+                fallback_reason = extraction_fallback_reason(call_extractions)
+                validation_result = "fallback" if fallback_reason else "ok"
+                guardrails.record_success()
             trace.add(
-                "root",
-                "guardrail_stop",
-                {"reason": stop_reason, "call_id": call.call_id},
-                f"stopped with {len(extractions)} extracted field rows",
-                fallback_reason=stop_reason,
-                validation_result="stopped",
+                "sub-rlm",
+                "extract_call_fields",
+                {
+                    "call_id": call.call_id,
+                    "field_count": len(schema_specs),
+                    "extractor": extractor.name,
+                },
+                (
+                    f"supported_fields={sum(not item.abstained for item in call_extractions)} "
+                    f"validation_errors={sum(len(item.validation_errors) for item in call_extractions)}"
+                ),
+                latency_ms=outcome.latency_ms,
+                tokens=outcome.usage,
+                fallback_reason=fallback_reason,
+                prompt_hash=outcome.prompt_hash,
+                validation_result=validation_result,
             )
+            extractions.extend(call_extractions)
+            stop_reason = guardrails.stop_reason(usage_summary_from_components(inducer, extractor))
+            if stop_reason:
+                trace.add(
+                    "root",
+                    "guardrail_stop",
+                    {"reason": stop_reason, "call_id": call.call_id},
+                    f"stopped with {len(extractions)} extracted field rows",
+                    fallback_reason=stop_reason,
+                    validation_result="stopped",
+                )
+                stopped = True
+                break
+        if stopped:
             break
 
     manifest["prompt_state"] = prompt_state(inducer, extractor)

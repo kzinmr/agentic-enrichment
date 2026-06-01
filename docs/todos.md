@@ -80,6 +80,10 @@
 
 ## P1 — 並列化（トポロジ変更不要の素直な fan-out）
 
+> **実装状況（2026-06-01）: T4 ✅ / T5 ✅ 完了**。検証: CU 13/13・QU 21/21 PASS、ヒューリスティック実データで逐次↔並列の抽出結果一致を end-to-end 確認。
+> - **T4**: `LLMFieldExtractor.extract_batch`（bounded `ThreadPoolExecutor`、入力順保持）と汎用ディスパッチ `run_call_extractions`（`extract_batch` 非対応の抽出器は決定論的逐次フォールバック）を追加。`pipeline.analyze_calls` を「バッチ単位で実行→各 outcome を観測」に再構成し、T3 ガードレール（連続エラー/予算/タイムアウト）と T1 usage を並列下でも保持。CLI に `--batch-max-concurrent`(既定8、1で逐次=従来同一)。usage 集計は `UsageSummary.add_call` を `threading.Lock` で直列化し、`complete_json_with_usage` で per-call トークンを正確に trace。
+> - **T5**: 検索ステップに `queries` 配列（map-reduce fan-out）を導入。`execute_step` の検索分岐が `run_subquery_searches` で並列実行し、既存 `merge_chunks`/`merge_records` で重複排除統合、各サブ検索を個別 trace（`fanout` 注記付き）。後方互換：単一クエリは要素1として従来挙動を完全保持。多様性検証は `diverse_subqueries`（fan-out 内）と `validate_search_diversity`（サブクエリ間にも適用）で二重化。RETRIEVAL_CONTROLLER / QUERY_PLANNER プロンプトに fan-out 指南（太いプロンプト×小さいバッチ、~20上限、極小×巨大はアンチパターン）を追記しバージョン更新。差集合系クエリ（「Xに見えるが Y が無い」）が1プランの2サブクエリとして表現可能に。
+
 ### T4. CU per-call 抽出の batching / 並列化（map）
 
 - **現状**: `for call in calls:` で**完全逐次**（`pipeline.py:115`）。各コールは独立＝embarrassingly parallel なのに直列。各コールの抽出は単発 `complete_json`（`extraction.py:59-77`）。

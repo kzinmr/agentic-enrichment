@@ -1,15 +1,35 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+import time
 from typing import Any, Protocol
 
 from .fields import extract_call_fields, extract_field, next_action, urgency
-from .llm import JSONChatClient, LLMError
+from .llm import JSONChatClient, LLMError, empty_call_usage
 from .models import CallRecord, Chunk, FieldExtraction, FieldSpec
 from .prompt_registry import FIELD_EXTRACTION_PROMPT, PromptRender
+from .usage import usage_delta, usage_summary_from_components
 
 
 class ExtractionError(RuntimeError):
     pass
+
+
+@dataclass
+class CallExtractionOutcome:
+    """Per-call extraction result with the telemetry the pipeline needs to trace it.
+
+    ``error`` is set only when extraction raised without a fallback (a hard failure the
+    guardrail counts); otherwise ``extractions`` holds the validated/fallback rows.
+    """
+
+    call: CallRecord
+    extractions: list[FieldExtraction]
+    latency_ms: float
+    usage: dict[str, Any] = field(default_factory=empty_call_usage)
+    prompt_hash: str | None = None
+    error: str | None = None
 
 
 class FieldExtractor(Protocol):
@@ -62,19 +82,148 @@ class LLMFieldExtractor:
         chunks: list[Chunk],
         specs: list[FieldSpec],
     ) -> list[FieldExtraction]:
+        outcome = self._extract_one(call, chunks, specs)
+        if outcome.error is not None:
+            raise ExtractionError(outcome.error)
+        return outcome.extractions
+
+    def extract_batch(
+        self,
+        calls: list[CallRecord],
+        chunks_by_call: dict[str, list[Chunk]],
+        specs: list[FieldSpec],
+        *,
+        max_concurrent: int = 1,
+    ) -> list[CallExtractionOutcome]:
+        # Per-call extraction is embarrassingly parallel: each call's prompt, validation, and
+        # fallback are independent. We run them with bounded concurrency while preserving input
+        # order so the materialized result is identical to the sequential path.
+        if max_concurrent <= 1 or len(calls) <= 1:
+            return [self._extract_one(call, chunks_by_call.get(call.call_id, []), specs) for call in calls]
+        outcomes: list[CallExtractionOutcome | None] = [None] * len(calls)
+        with ThreadPoolExecutor(max_workers=min(max_concurrent, len(calls))) as executor:
+            futures = {
+                executor.submit(self._extract_one, call, chunks_by_call.get(call.call_id, []), specs): index
+                for index, call in enumerate(calls)
+            }
+            for future in as_completed(futures):
+                outcomes[futures[future]] = future.result()
+        return [outcome for outcome in outcomes if outcome is not None]
+
+    def _extract_one(
+        self,
+        call: CallRecord,
+        chunks: list[Chunk],
+        specs: list[FieldSpec],
+    ) -> CallExtractionOutcome:
         prompt = build_extraction_prompt_render(call, chunks, specs)
-        self.last_prompt = prompt.metadata()
+        metadata = prompt.metadata()
+        self.last_prompt = metadata
+        prompt_hash = metadata.get("prompt_hash") if isinstance(metadata, dict) else None
+        started = time.perf_counter()
+        usage = empty_call_usage()
         try:
-            payload = self.llm.complete_json(system=prompt.system, user=prompt.user)
-            return validate_extraction_payload(payload, call=call, chunks=chunks, specs=specs, extractor=self.name)
+            payload, usage = self._llm_complete(prompt.system, prompt.user)
+            extractions = validate_extraction_payload(payload, call=call, chunks=chunks, specs=specs, extractor=self.name)
+            return CallExtractionOutcome(
+                call=call,
+                extractions=extractions,
+                latency_ms=_elapsed_ms(started),
+                usage=usage,
+                prompt_hash=prompt_hash,
+            )
         except (LLMError, ValueError, TypeError) as exc:
             if self.fallback is None:
-                raise ExtractionError(str(exc)) from exc
+                return CallExtractionOutcome(
+                    call=call,
+                    extractions=[],
+                    latency_ms=_elapsed_ms(started),
+                    usage=usage,
+                    prompt_hash=prompt_hash,
+                    error=str(exc)[:240],
+                )
             fallback_extractions = self.fallback.extract_call_fields(call, chunks, specs)
             for extraction in fallback_extractions:
                 extraction.validation_errors.append(f"llm_fallback:{exc}")
                 extraction.rationale = f"{extraction.rationale}; LLM fallback because {exc}"
-            return fallback_extractions
+            return CallExtractionOutcome(
+                call=call,
+                extractions=fallback_extractions,
+                latency_ms=_elapsed_ms(started),
+                usage=usage,
+                prompt_hash=prompt_hash,
+            )
+
+    def _llm_complete(self, system: str, user: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        # Prefer the usage-returning entrypoint so per-call token attribution stays accurate
+        # under concurrency; fall back to a usage snapshot for clients that lack it.
+        method = getattr(self.llm, "complete_json_with_usage", None)
+        if callable(method):
+            payload, usage = method(system=system, user=user)
+            return payload, usage if isinstance(usage, dict) else empty_call_usage()
+        before = usage_summary_from_components(self.llm)
+        payload = self.llm.complete_json(system=system, user=user)
+        after = usage_summary_from_components(self.llm)
+        return payload, usage_delta(after, before)
+
+
+def run_call_extractions(
+    extractor: FieldExtractor,
+    calls: list[CallRecord],
+    chunks_by_call: dict[str, list[Chunk]],
+    specs: list[FieldSpec],
+    *,
+    max_concurrent: int = 1,
+) -> list[CallExtractionOutcome]:
+    """Run per-call extraction, using the extractor's native batch path when available.
+
+    Extractors that implement ``extract_batch`` (e.g. the LLM extractor) get bounded
+    concurrency; others fall back to a deterministic sequential loop that still yields the
+    same per-call telemetry, so the pipeline treats both uniformly.
+    """
+    native = getattr(extractor, "extract_batch", None)
+    if callable(native):
+        return native(calls, chunks_by_call, specs, max_concurrent=max_concurrent)
+    return [
+        _sequential_outcome(extractor, call, chunks_by_call.get(call.call_id, []), specs)
+        for call in calls
+    ]
+
+
+def _sequential_outcome(
+    extractor: FieldExtractor,
+    call: CallRecord,
+    chunks: list[Chunk],
+    specs: list[FieldSpec],
+) -> CallExtractionOutcome:
+    before = usage_summary_from_components(extractor)
+    started = time.perf_counter()
+    try:
+        extractions = extractor.extract_call_fields(call, chunks, specs)
+        error = None
+    except (ExtractionError, ValueError, TypeError) as exc:
+        extractions = []
+        error = str(exc)[:240]
+    return CallExtractionOutcome(
+        call=call,
+        extractions=extractions,
+        latency_ms=_elapsed_ms(started),
+        usage=usage_delta(usage_summary_from_components(extractor), before),
+        prompt_hash=_prompt_hash(extractor),
+        error=error,
+    )
+
+
+def _prompt_hash(component: object) -> str | None:
+    prompt = getattr(component, "last_prompt", None)
+    if isinstance(prompt, dict):
+        value = prompt.get("prompt_hash")
+        return str(value) if value else None
+    return None
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 3)
 
 
 def build_extraction_prompt(
