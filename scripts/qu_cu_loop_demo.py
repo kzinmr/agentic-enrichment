@@ -102,6 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-errors", type=int, default=3)
     parser.add_argument("--max-budget-usd", type=float, default=None)
     parser.add_argument("--max-timeout-seconds", type=float, default=None)
+    parser.add_argument("--max-plan-iterations", type=int, default=2)
     parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--embedding-cache", type=Path, default=None)
     parser.add_argument("--llm-base-url", default=None)
@@ -523,6 +524,7 @@ def build_qu_agent(args: argparse.Namespace, *, corpus_dir: Path) -> QueryUnders
         max_errors=args.max_errors,
         max_budget_usd=args.max_budget_usd,
         max_timeout_seconds=args.max_timeout_seconds,
+        max_plan_iterations=args.max_plan_iterations,
     )
 
 

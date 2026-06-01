@@ -103,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-errors", type=int, default=3)
     parser.add_argument("--max-budget-usd", type=float, default=None)
     parser.add_argument("--max-timeout-seconds", type=float, default=None)
+    parser.add_argument(
+        "--max-plan-iterations",
+        type=int,
+        default=2,
+        help="Bounded outer plan/execute/judge/replan loop. Set 1 for the legacy single-plan path.",
+    )
     parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--embedding-cache", type=Path, default=None)
     return parser
@@ -149,6 +155,7 @@ def main() -> int:
         max_errors=args.max_errors,
         max_budget_usd=args.max_budget_usd,
         max_timeout_seconds=args.max_timeout_seconds,
+        max_plan_iterations=args.max_plan_iterations,
     )
     if args.eval_tasks:
         report = run_eval(agent, args.eval_tasks)

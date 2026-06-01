@@ -260,8 +260,8 @@
   </p>
   <div class="meta">
     <span>schema_version <b>silver.rlm.v1</b></span>
-    <span>prompt baseline <b>2026-05-29.1</b></span>
-    <span>last updated <b>2026-05-30</b></span>
+    <span>prompt baseline <b>2026-06-01.1</b></span>
+    <span>last updated <b>2026-06-01</b></span>
   </div>
 </header>
 
@@ -460,8 +460,8 @@
       </g>
       <g>
         <rect x="250" y="410" width="120" height="48" rx="4" fill="#f3e8db" stroke="#8b5a2b" stroke-width="1.2"/>
-        <text x="310" y="432" text-anchor="middle" class="node-title">plan_query</text>
-        <text x="310" y="448" text-anchor="middle" class="node-sub">LLM-first</text>
+        <text x="310" y="432" text-anchor="middle" class="node-title">plan/replan</text>
+        <text x="310" y="448" text-anchor="middle" class="node-sub">observe + judge</text>
       </g>
       <g>
         <rect x="400" y="410" width="160" height="48" rx="4" fill="#f3e8db" stroke="#8b5a2b" stroke-width="1.2"/>
@@ -481,7 +481,7 @@
       <g>
         <rect x="950" y="410" width="140" height="48" rx="4" fill="#fff" stroke="#8b5a2b" stroke-width="1.2"/>
         <text x="1020" y="432" text-anchor="middle" class="node-title">answer.json</text>
-        <text x="1020" y="448" text-anchor="middle" class="node-sub">+ judgement</text>
+        <text x="1020" y="448" text-anchor="middle" class="node-sub">+ plan_iterations</text>
       </g>
 
       <!-- QU arrows -->
@@ -501,7 +501,7 @@
             stroke="#b3261e" stroke-width="1.6" fill="none" marker-end="url(#arr-feedback)"/>
       <g>
         <rect x="780" y="500" width="220" height="28" rx="4" fill="#fff" stroke="#b3261e" stroke-width="1"/>
-        <text x="890" y="519" text-anchor="middle" class="node-sub" style="fill:#b3261e">column_requests + judgement + prompt_repair</text>
+        <text x="890" y="519" text-anchor="middle" class="node-sub" style="fill:#b3261e">column_requests + judgement + plan_observation</text>
       </g>
 
       <!-- iteration ticker -->
@@ -754,7 +754,7 @@
         <td>QU</td>
         <td><code>--planner</code></td>
         <td>openai / openai-compatible</td>
-        <td>catalog integrity, validate_steps, fallback chain</td>
+        <td>catalog integrity, replan observation, validate_steps</td>
       </tr>
       <tr>
         <td>Retrieval subagent</td>
@@ -848,7 +848,7 @@
     <div class="row">
       <code>baseline_answers/&lt;task_id&gt;.json</code>
       <span class="kind">QU per-task</span>
-      <span class="desc">answer + plan + records + aggregation + evidence + judgement + column_requests + search_diagnostics + rerank + prompt_state + trace.</span>
+      <span class="desc">answer + plan + plan_iterations + records + aggregation + evidence + judgement + column_requests + search_diagnostics + rerank + prompt_state + usage_summary + guardrails + trace.</span>
     </div>
     <div class="row">
       <code>column_requests.jsonl</code>
@@ -948,7 +948,7 @@
     <div class="issue">
       <span class="id">OBS-001</span>
       <span class="label">Budget / observability / replay</span>
-      <span class="status partial">Partial</span>
+      <span class="status done">Done</span>
     </div>
     <div class="issue">
       <span class="id">FB-001</span>
@@ -1003,7 +1003,7 @@
 <!-- ============================================== -->
 <section>
   <h2>08 — Design Principles</h2>
-  <h3 class="title">10 things this architecture believes</h3>
+  <h3 class="title">11 things this architecture believes</h3>
   <ol style="font-size: 15px; color: var(--ink); line-height: 1.7; padding-left: 22px; max-width: 900px;">
     <li><b>Tool boundary is fixed at five tools.</b> Raw transcripts never reach an LLM; all references go through <code style="font-family:var(--mono);background:var(--bg-panel-alt);padding:1px 5px;border-radius:3px">chunk:&lt;id&gt;</code>.</li>
     <li><b>All three pillars share versioned identity + promotion gate.</b> Catalog / prompts / queries follow the same lifecycle.</li>
@@ -1012,6 +1012,7 @@
     <li><b>Bake <code>PROMOTION_GATE</code> into the data.</b> "Why we don't promote" is recorded in the artifact itself.</li>
     <li><b>Operationally separate self-eval bias.</b> Judge ↔ planner model separation; synthetic queries stay outside promotion gates.</li>
     <li><b>LLM-first + reliability fallback.</b> Semantic decisions belong to the LLM; heuristics only catch validation/API failures and support smoke tests.</li>
+    <li><b>Observe before changing course.</b> QU runs a bounded plan → execute → judge/observe → replan loop, while success remains judge-mediated.</li>
     <li><b>Append-only signal logs.</b> column_requests / prompt_repair_request / orchestration_trace accumulate over time and are aggregated downstream.</li>
     <li><b>Keep deterministic control.</b> BM25 explainability, query diversity, forced search iteration, and smoke eval are retained as reliability infrastructure.</li>
     <li><b>Observability via structured JSON.</b> Trace tool names expand backend / provider / fallback chain into strings.</li>
@@ -1020,8 +1021,8 @@
 
 <footer class="foot">
   <span>cu-agent-rlm × qu-agent-rlm</span>
-  <span>schema_version silver.rlm.v1 · prompt baseline 2026-05-29.1</span>
-  <span>last reviewed 2026-05-30</span>
+  <span>schema_version silver.rlm.v1 · prompt baseline 2026-06-01.1</span>
+  <span>last reviewed 2026-06-01</span>
 </footer>
 
 </div>

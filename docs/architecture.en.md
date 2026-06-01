@@ -41,7 +41,7 @@ The agent can only call a fixed set of five tools (QU's retrieval is subdivided 
 | `run_sql` | Databricks SELECT (contract only; not yet implemented) | Databricks SQL |
 | `review_schema_gaps` | QU meta-tool: structures unanswerable shapes | — |
 
-QU's inner loop adds a **search controller** and **reranker** as LLM-driven tools (see below).
+QU also has an **outer planner/replanner loop** and an **inner retrieval subagent loop**. Both mutate the same pass-by-reference state dictionary, while raw transcript text never rises above the snippets returned by `fetch_chunks` (see below).
 
 ---
 
@@ -70,22 +70,23 @@ Every LLM call goes through a versioned `PromptSpec`.
 @dataclass(frozen=True)
 class PromptSpec:
     prompt_id: str       # "qu.query_planner"
-    version: str         # "2026-05-29.1"
+    version: str         # "2026-06-01.1"
     role: str            # "planner" | "judge" | "extractor" | ...
     system: str
 ```
 
-Defined prompts (all at version `2026-05-29.1`):
+Main prompt definitions:
 
-| prompt_id | role | location |
-|---|---|---|
-| `qu.query_planner` | planner | `qu/prompt_registry.py` |
-| `qu.retrieval_controller` | retrieval_subagent | same |
-| `qu.reranker` | reranker | same |
-| `qu.answer_judge` | judge | same |
-| `qu.downstream_query_bootstrap` | query_bootstrapper | same |
-| `cu.schema_induction` | inducer | `cu/prompt_registry.py` |
-| `cu.field_extraction` | extractor | same |
+| prompt_id | role | current version | location |
+|---|---|---|---|
+| `qu.query_planner` | planner | `2026-06-01.1` | `qu/prompt_registry.py` |
+| `qu.query_replanner` | planner | `2026-06-01.1` | same |
+| `qu.retrieval_controller` | retrieval_subagent | `2026-06-01.1` | same |
+| `qu.reranker` | reranker | `2026-05-29.1` | same |
+| `qu.answer_judge` | judge | `2026-05-29.1` | same |
+| `qu.downstream_query_bootstrap` | query_bootstrapper | `2026-05-29.1` | same |
+| `cu.schema_induction` | inducer | `2026-05-29.1` | `cu/prompt_registry.py` |
+| `cu.field_extraction` | extractor | `2026-05-29.1` | same |
 
 `frozen=True` makes **automatic runtime mutation type-impossible**. Changes require a new `PromptSpec` instance (i.e. a version bump).
 
@@ -187,21 +188,37 @@ recommended_status = "promote" if support_count > 0 and evidence_coverage >= 0.7
 
 ## 5. QU Pipeline
 
-### 5.1 Multi-step executor
+### 5.1 Observation-driven planner loop + multi-step executor
 
 ```
 load_schema
-  → plan_query  (LLM-first; provenance: plan_query:<planner_name>)
-  → [steps executed sequentially, accumulating state]
-       ├─ search_chunks / bm25_search_chunks / embedding_search_chunks
-       ├─ query_silver
-       ├─ aggregate_silver
-       ├─ fetch_chunks
-       └─ review_schema_gaps
-  → run_search_iterations  (ReAct-style loop only after search steps)
-  → rerank_search_results  (LLM reranker, optional)
-  → answer_judge           (LLM-first; heuristic only as validation-failure fallback)
+  → for plan_iteration in range(max_plan_iterations):
+       ├─ plan_query / replan_query
+       │    iteration 0: original query + catalog
+       │    iteration >0: previous state/judgement/search diagnostics/column_requests
+       ├─ [steps executed sequentially, accumulating state]
+       │    ├─ search_chunks / bm25_search_chunks / embedding_search_chunks
+       │    ├─ query_silver
+       │    ├─ aggregate_silver
+       │    ├─ fetch_chunks
+       │    └─ review_schema_gaps
+       ├─ run_search_iterations  (retrieval subagent loop after search steps)
+       ├─ rerank_search_results  (LLM reranker, optional)
+       ├─ answer_judge           (LLM-first; heuristic only as validation-failure fallback)
+       └─ stop if success / guardrail stop / iteration limit, else plan_observation → replan_query
 ```
+
+`--max-plan-iterations` (default 2; set to `1` for the legacy-equivalent path) bounds the outer loop. `LLMQueryPlanner` implements `replan(query, catalog, observation)`, while heuristic/static planners keep the backwards-compatible single-plan path.
+
+The replan observation passes only compact views, never raw transcripts:
+
+- compact `records` / `aggregation` / `evidence`
+- `chunks_for_llm(state["chunks"])` and `summarize_search_calls_for_llm(state["search_calls"])`
+- `search_failures`, judge `failure_modes`, and `needs_cu_feedback`
+- existing `column_requests`
+- `guardrails` and count-style `state_counts`
+
+The key design point is that the replanner is not limited to forcing the query into existing silver fields. It can also stop with **a best-effort answer plus constructive CU field-design proposals in `column_requests`**.
 
 Default step sequences per operation:
 
@@ -213,7 +230,20 @@ Default step sequences per operation:
 
 `validate_steps` enforces **invariants on operation → tool ordering** (e.g. `query_silver` is auto-inserted before `aggregate_silver` when missing; `fetch_chunks` is auto-appended when `retrieve_evidence=True`).
 
-### 5.2 Retrieval backend
+### 5.2 plan/replan trace
+
+QU answer JSON now retains `plan_iterations[]` in addition to the final `plan`. Each entry includes `iteration`, `plan`, `observation`, `judgement`, and `best_partial_answer`. The trace adds these structured events:
+
+| trace tool | meaning |
+|---|---|
+| `plan_query:<planner>` | initial plan at iteration 0 |
+| `plan_observation` | compact observation handed to replanning after judge |
+| `replan_query:<planner>` | updated plan at iteration >0 |
+| `arguments.plan_iteration` on any tool event | which plan iteration produced the event |
+
+Termination remains judge-mediated rather than planner self-declared. This deliberately avoids leaning on an `answer["ready"]`-style planner self-check and preserves the planner/judge separation.
+
+### 5.3 Retrieval backend
 
 `SilverCorpus` exposes four methods:
 
@@ -244,7 +274,7 @@ return f"account: {account_text}\nsilver_fields: {field_text}\ntranscript_chunk:
 
 `documents_hash = SHA256(model + sorted[(chunk_id, embedding_text)])` manages the hash. Any change to chunk text, catalog `filterable` fields, silver values, or model name produces a hash mismatch and triggers automatic re-embedding.
 
-### 5.3 Retrieval Subagent
+### 5.4 Retrieval Subagent
 
 `AgenticRetrievalSubAgent` supersedes `--search-controller` (the old flag is Deprecated). With `--retrieval-subagent openai-compatible --llm-base-url <sid1-endpoint>`, SID-1-style retrieval models can be plugged in.
 
@@ -262,11 +292,11 @@ class SearchExecutionPolicy:
 
 On rejection, `forced_search_iteration` constructs a `diversified_query` by **converting prior `missing_terms` into the next query**. BM25 explainability turns "what we missed" into actionable exploration.
 
-### 5.4 Reranker
+### 5.5 Reranker
 
-`rerank_search_results` runs an LLM rerank after all steps complete. It rewrites `state["chunks"]` and attaches `rerank_score` / `rerank_reason`. On failure, ordering is preserved and only `llm_rerank:error` is appended to the trace.
+`rerank_search_results` runs an LLM rerank after each plan iteration's steps complete. It rewrites `state["chunks"]` and attaches `rerank_score` / `rerank_reason`. On failure, ordering is preserved and only `llm_rerank:error` is appended to the trace.
 
-### 5.5 Answerability Judge
+### 5.6 Answerability Judge
 
 ```python
 {
@@ -285,7 +315,7 @@ On rejection, `forced_search_iteration` constructs a `diversified_query` by **co
 }
 ```
 
-The LLM judge is the always-on default. `HeuristicAnswerJudge` is a reliability fallback for JSON validation / API failures and a smoke-test helper — it is not an agent intelligence mode exposed in CLI/demo. The LLM judge can use a different model from the planner via `--judge-model / --judge-base-url / --judge-api-key` (an operational path for avoiding self-bias / collusion).
+The LLM judge is the always-on default and runs at the end of each outer planner iteration. `HeuristicAnswerJudge` is a reliability fallback for JSON validation / API failures and a smoke-test helper — it is not an agent intelligence mode exposed in CLI/demo. The LLM judge can use a different model from the planner via `--judge-model / --judge-base-url / --judge-api-key` (an operational path for avoiding self-bias / collusion).
 
 ---
 
@@ -322,11 +352,11 @@ The LLM judge is the always-on default. `HeuristicAnswerJudge` is a reliability 
 
 ### 6.2 Three reverse channels
 
-1. **`column_requests`** — emitted directly by QU's planner / `review_schema_gaps` step
+1. **`column_requests`** — emitted directly by QU's planner / replanner / `review_schema_gaps` step
 2. **`search_diagnostics.failures`** — auto-generated from BM25 explainability's `missing_terms`
 3. **`judgement.missing_field_requests`** — the answer judge autonomously proposes CU improvements
 
-`summarize_feedback` priority-merges all three channels; same-name fields accumulate via `count`.
+`summarize_feedback` priority-merges all three channels; same-name fields accumulate via `count`. Because the replanner sees existing `column_requests` inside the same query run, it can branch among "search again", "switch to a different filter", and "stop with a CU field proposal."
 
 ### 6.3 Reliability fallback's feedback-aware filter detection
 
@@ -395,7 +425,7 @@ output/qu_cu_loop_demo/
 | `feedback_report.json` | QU→CU feedback result | accepted_into_schema, promoted_to_silver, validation_error_counts |
 | `evaluation_tasks.json` | CU self-generated smoke tasks | Self-referential; not an external fixture |
 | `databricks_contract.json` | Production wiring contract | allowlisted_tools, sql_policy |
-| QU answer JSON | Per-query result | answer, plan, records, aggregation, evidence, judgement, column_requests, search_diagnostics, rerank, prompt_state, trace |
+| QU answer JSON | Per-query result | answer, plan, plan_iterations, records, aggregation, evidence, judgement, column_requests, search_diagnostics, rerank, prompt_state, usage_summary, guardrails, best_partial_answer, trace |
 | `column_requests.jsonl` | QU → CU reverse channel | Append-only; ships with search_diagnostics and judgement |
 | `prompt_repair_request.jsonl` | Prompt improvement signal | **signal-only**, `action: collect_signal_only`, `promotion_gate: external_hand_labeled_eval_required` |
 | `query_tasks.jsonl` | Primary query set | task_id, source_type, label_status, generation_id, adjusted_for, provenance |
@@ -482,7 +512,7 @@ Summary of `cu-agent-rlm/docs/issues.md`:
 | EVID-001 | Span-level evidence and privacy filtering | Open |
 | **EVAL-001** | **External evaluation fixtures** | **Open (prerequisite for FB-002)** |
 | DBX-001 | Databricks production tool adapters | Open |
-| OBS-001 | Budget, observability, replay | Partial (skeleton via orchestration_trace; latency/cost not yet captured) |
+| OBS-001 | Budget, observability, replay | Done (usage/cost, latency, prompt hash, fallback reason, replay redaction) |
 | FB-001 | Model-feedback and prompt-improvement loop | Partial (schema improvement done) |
 | **FB-002** | **Prompt lab and eval-gated prompt promotion** | **Blocked on EVAL-001** |
 | DE-001 | CU bootstrap context pack | Design enhancement |
@@ -506,9 +536,10 @@ Summary of `cu-agent-rlm/docs/issues.md`:
 5. **Bake `PROMOTION_GATE` into the data.** "Why we don't promote" is recorded in the artifact itself.
 6. **Operationally separate self-eval bias.** Judge ↔ planner model separation flags; synthetic queries stay outside the promotion gate.
 7. **LLM-first + reliability fallback.** Semantic decisions belong to the LLM; heuristics only catch validation/API failures and support smoke tests.
-8. **Append-only signal logs.** `column_requests.jsonl`, `prompt_repair_request.jsonl`, `orchestration_trace.jsonl` accumulate over time and are aggregated downstream.
-9. **Keep deterministic control.** BM25 explainability, query diversity, forced search iteration, and smoke eval are retained as reliability infrastructure.
-10. **Observability via structured JSON.** Trace tool names expand backend / provider / fallback chain into strings.
+8. **Observe before changing course.** QU runs a bounded `plan → execute → judge/observe → replan` loop, while success remains judge-mediated.
+9. **Append-only signal logs.** `column_requests.jsonl`, `prompt_repair_request.jsonl`, `orchestration_trace.jsonl` accumulate over time and are aggregated downstream.
+10. **Keep deterministic control.** BM25 explainability, query diversity, forced search iteration, and smoke eval are retained as reliability infrastructure.
+11. **Observability via structured JSON.** Trace tool names expand backend / provider / fallback chain into strings.
 
 ---
 
@@ -535,14 +566,14 @@ Summary of `cu-agent-rlm/docs/issues.md`:
 
 | File | Responsibility |
 |---|---|
-| `agent.py` | `QueryUnderstandingAgent` (multi-step executor) |
+| `agent.py` | `QueryUnderstandingAgent` (bounded plan/execute/judge/replan loop + multi-step executor) |
 | `corpus.py` | `SilverCorpus` (four retrieval methods) |
 | `retrieval.py` | bm25s wrapper + `FallbackBM25` (explainer) + `EmbeddingIndex` + BM25F-lite composition |
 | `retrieval_agent.py` | `AgenticRetrievalSubAgent` (controller + reranker + diversity check) |
-| `planner.py` | `QueryPlan` / `QueryToolStep` / `ColumnRequest` + Heuristic/LLM planner + validator for the 7 `ALLOWED_STEP_TOOLS` |
+| `planner.py` | `QueryPlan` / `QueryToolStep` / `ColumnRequest` + Heuristic/LLM planner/replanner + validator for the 7 `ALLOWED_STEP_TOOLS` |
 | `judge.py` | `AnswerJudge` Protocol + Heuristic / LLM / Noop |
 | `query_tasks.py` | `QueryTask` normalization + `LLMDownstreamQueryGenerator` + smoke-test heuristic bootstrap helper |
-| `prompt_registry.py` | `PromptSpec(frozen=True)` + QU-side prompt definitions |
+| `prompt_registry.py` | `PromptSpec(frozen=True)` + QU-side prompt definitions (planner / replanner / retrieval / judge) |
 | `prompt_repair.py` | Emits `prompt_repair_request.jsonl` (signal-only) |
 | `llm.py` | LLM client definitions (kept duplicated with CU to preserve dependency isolation) |
 | `cli.py` | CLI argparse + planner/judge/subagent/reranker factories |
@@ -553,9 +584,9 @@ Summary of `cu-agent-rlm/docs/issues.md`:
 
 | File | Responsibility |
 |---|---|
-| `qu_cu_loop_demo.py` | Outer-loop orchestration runner; full run including `query_tasks` + `orchestration_trace` |
+| `qu_cu_loop_demo.py` | CU↔QU orchestration runner; full run including `query_tasks` + `orchestration_trace` |
 | `qu_user_query_demo.py` | Single user-query demo (defaults to agentic retrieval + OpenAI planner/reranker/judge) |
 
 ---
 
-**Last updated**: 2026-05-30 / **schema_version**: `silver.rlm.v1` / **prompt baseline**: `2026-05-29.1`
+**Last updated**: 2026-06-01 / **schema_version**: `silver.rlm.v1` / **prompt baseline**: `2026-06-01.1`

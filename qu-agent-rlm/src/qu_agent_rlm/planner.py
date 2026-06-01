@@ -5,7 +5,7 @@ import re
 from typing import Any, Protocol
 
 from .llm import JSONChatClient, LLMError
-from .prompt_registry import QUERY_PLANNER_PROMPT, PromptRender
+from .prompt_registry import QUERY_PLANNER_PROMPT, QUERY_REPLANNER_PROMPT, PromptRender
 
 
 ALLOWED_STEP_TOOLS = {
@@ -117,6 +117,20 @@ class LLMQueryPlanner:
             plan.reasoning = f"LLM planner failed validation or request: {exc}"
             return plan
 
+    def replan(self, query: str, catalog: dict[str, Any], observation: dict[str, Any]) -> QueryPlan:
+        prompt = build_llm_replanner_prompt_render(query, catalog, observation)
+        self.last_prompt = prompt.metadata()
+        try:
+            payload = self.llm.complete_json(system=prompt.system, user=prompt.user)
+            return plan_from_llm_payload(payload, query, catalog, planner=self.name)
+        except (LLMError, ValueError, TypeError) as exc:
+            if self.fallback is None:
+                raise
+            plan = self.fallback.plan(query, catalog)
+            plan.planner = f"{self.name}->fallback:{self.fallback.name}"
+            plan.reasoning = f"LLM replanner failed validation or request: {exc}"
+            return plan
+
 
 def heuristic_plan_query(query: str, catalog: dict[str, Any]) -> QueryPlan:
     text = query.lower()
@@ -190,6 +204,32 @@ def build_llm_planner_prompt_render(query: str, catalog: dict[str, Any]) -> Prom
         }
     )
     return prompt
+
+
+def build_llm_replanner_prompt_render(
+    query: str,
+    catalog: dict[str, Any],
+    observation: dict[str, Any],
+) -> PromptRender:
+    fields = [
+        {
+            "name": field["name"],
+            "type": field["type"],
+            "description": field.get("description", ""),
+            "allowed_values": field.get("allowed_values", []),
+            "filterable": field.get("search", {}).get("filterable", True),
+            "aggregatable": field.get("search", {}).get("aggregatable", False),
+        }
+        for field in catalog.get("fields", [])
+    ]
+    return QUERY_REPLANNER_PROMPT.render(
+        {
+            "query": query,
+            "schema_version": catalog.get("schema_version"),
+            "fields": fields,
+            "observation": observation,
+        }
+    )
 
 
 def plan_from_llm_payload(

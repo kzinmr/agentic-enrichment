@@ -111,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-errors", type=int, default=3)
     parser.add_argument("--max-budget-usd", type=float, default=None)
     parser.add_argument("--max-timeout-seconds", type=float, default=None)
+    parser.add_argument("--max-plan-iterations", type=int, default=2)
     parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--embedding-cache", type=Path, default=None)
     parser.add_argument(
@@ -285,6 +286,7 @@ def build_agent(args: argparse.Namespace, *, corpus_dir: Path) -> QueryUnderstan
         max_errors=args.max_errors,
         max_budget_usd=args.max_budget_usd,
         max_timeout_seconds=args.max_timeout_seconds,
+        max_plan_iterations=args.max_plan_iterations,
     )
 
 
@@ -367,6 +369,7 @@ def build_agent_context(args: argparse.Namespace, *, corpus_dir: Path, output_di
             "llm_model": args.llm_model,
             "judge_model": args.judge_model or args.llm_model,
             "embedding_model": args.embedding_model,
+            "max_plan_iterations": args.max_plan_iterations,
         },
     }
 
