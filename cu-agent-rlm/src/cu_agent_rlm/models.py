@@ -93,6 +93,7 @@ class ContentUnderstandingArtifact:
     chunks: list[Chunk]
     field_specs: list[FieldSpec]
     extractions: list[FieldExtraction]
+    extraction_contract: dict[str, Any]
     quality_report: dict[str, Any]
     feedback_report: dict[str, Any]
     silver_schema_catalog: dict[str, Any]

@@ -173,6 +173,10 @@
 
 ## 横断 — Document Schema のポータビリティ（外部ジョブでの抽出実行）
 
+> **実装状況（2026-06-02）: T10 ✅ / T11 ✅ 完了**。検証: CU 15/15 PASS、`compileall` PASS。
+> - **T10**: `extraction_contract.json` を出力し、`manifest.portable_extraction` から参照。契約には `cu.field_extraction@2026-05-29.1` の prompt 本文/hash、出力 envelope、`chunk:` evidence ref prefix、chunking パラメータ、`field_specs.jsonl` / `chunks.jsonl` / `silver_schema_catalog.json` の artifact 参照を含める。`portable_extractor` は `cu_agent_rlm` 非依存の top-level runtime として切り出し、`build_user_payload` / `derive_response_schema` / `validate` を提供。本体 `LLMFieldExtractor` も同じ payload builder / validator を使うようにし、同等性テストで結線。
+> - **T11**: `cu.schema_induction.output@2026-06-02.1` の凍結 JSON Schema contract を追加し、`LLMSchemaInducer` が対応バックエンドでは strict `json_schema` 経路を使用。`OpenAIResponsesClient` は Responses `text.format=json_schema`、`OpenAICompatibleChatClient` は `OPENAI_COMPATIBLE_JSON_SCHEMA` / init flag が有効な場合のみ Chat Completions `response_format=json_schema` を使い、既定は従来 `json_object` にフォールバック。validator は strict 経路では shape/type を schema 境界に委譲し、name 正規化・dedupe・RESERVED 除外・allowed_values 条件・`not_mentioned` 注入・flags/max_fields/0件 raise の残差を維持。
+
 ### T10. ポータブルな Document Schema export contract ＋ standalone extraction runtime（EXPORT-001）
 
 - **優先度**: 要件駆動（CU-QU loop が生成した Document Schema を artifact として書き出し、**外部の Python ジョブが読み込んで Schema 準拠の LLM 抽出を自己完結実行**する要件）。RLM ラダー（P0–P3）とは直交する packaging/portability の課題。
@@ -236,4 +240,4 @@ RLM は「良い分解行動」を**訓練側の報酬（`RLMTrainRubric` の be
 
 ---
 
-**Last updated**: 2026-06-01 / **対象コミット**: main / **典拠**: コード監査（`agent.py` `pipeline.py` `retrieval_agent.py` `extraction.py`）+ `issues.md` + RLM 解説2本
+**Last updated**: 2026-06-02 / **対象コミット**: main / **典拠**: コード監査（`agent.py` `pipeline.py` `retrieval_agent.py` `extraction.py`）+ `issues.md` + RLM 解説2本

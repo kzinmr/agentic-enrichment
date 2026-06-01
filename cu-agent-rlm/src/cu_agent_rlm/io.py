@@ -133,6 +133,10 @@ def write_artifact(artifact: ContentUnderstandingArtifact, output_dir: Path) -> 
         json.dumps(artifact.databricks_contract, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    (output_dir / "extraction_contract.json").write_text(
+        json.dumps(artifact.extraction_contract, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     (output_dir / "evaluation_tasks.json").write_text(
         json.dumps(artifact.evaluation_tasks, ensure_ascii=False, indent=2),
         encoding="utf-8",

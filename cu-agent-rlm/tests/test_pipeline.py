@@ -11,12 +11,15 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from portable_extractor import derive_response_schema, validate as portable_validate
+
+from cu_agent_rlm.chunking import build_chunks
 from cu_agent_rlm.cli import parse_args
-from cu_agent_rlm.extraction import ExtractionError, LLMFieldExtractor
+from cu_agent_rlm.extraction import ExtractionError, LLMFieldExtractor, validate_extraction_payload
 from cu_agent_rlm.pipeline import run_content_understanding
 from cu_agent_rlm.io import load_calls
 from cu_agent_rlm.llm import DEFAULT_OPENAI_MODEL
-from cu_agent_rlm.models import CallRecord, TranscriptTurn
+from cu_agent_rlm.models import CallRecord, FieldSpec, TranscriptTurn
 from cu_agent_rlm.pipeline import analyze_calls
 from cu_agent_rlm.replay import REDACTED, redact_for_replay
 from cu_agent_rlm.schema import LLMSchemaInducer, StaticSchemaInducer
@@ -40,8 +43,12 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
             self.assertTrue((output / "silver_schema_catalog.json").exists())
             self.assertTrue((output / "silver_calls.jsonl").exists())
             self.assertTrue((output / "rlm_trace.jsonl").exists())
+            self.assertTrue((output / "extraction_contract.json").exists())
 
             self.assertEqual(artifact.manifest["schema_induction"]["inducer"], "heuristic")
+            self.assertEqual(artifact.manifest["portable_extraction"]["contract"], "extraction_contract.json")
+            self.assertEqual(artifact.extraction_contract["runtime"]["module"], "portable_extractor")
+            self.assertFalse(artifact.extraction_contract["runtime"]["imports_cu_agent_rlm"])
             field_names = {field["name"] for field in artifact.silver_schema_catalog["fields"]}
             self.assertIn("conversation_topic", field_names)
             self.assertIn("risk_or_blocker", field_names)
@@ -247,6 +254,90 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
         self.assertEqual(artifact.manifest["prompt_state"]["field_extractor"]["prompt_id"], "cu.field_extraction")
         self.assertIn("prompt_hash", artifact.manifest["prompt_state"]["schema_inducer"])
 
+    def test_portable_extractor_matches_runtime_validator(self) -> None:
+        call = sample_call_records()[0]
+        chunks = build_chunks([call])
+        specs = [
+            FieldSpec(
+                name="compliance_requirement",
+                type="list",
+                description="Compliance requirements mentioned by the customer.",
+                allowed_values=["sso", "audit_logs"],
+                downstream_use_cases=["filtering"],
+            ),
+            FieldSpec(
+                name="security_review_requested",
+                type="boolean",
+                description="Whether security review is requested.",
+                allowed_values=[],
+                downstream_use_cases=["review queue"],
+            ),
+        ]
+        payload = {
+            "fields": [
+                {
+                    "name": "compliance_requirement",
+                    "value": ["sso", "unexpected_value"],
+                    "confidence": "high",
+                    "evidence_refs": [f"chunk:{chunks[0].chunk_id}"],
+                    "abstained": False,
+                    "rationale": "The call mentions SSO.",
+                }
+            ]
+        }
+
+        runtime_rows = [
+            extraction.__dict__
+            for extraction in validate_extraction_payload(
+                payload,
+                call=call,
+                chunks=chunks,
+                specs=specs,
+                extractor="fixture",
+            )
+        ]
+        portable_rows = portable_validate(
+            payload,
+            specs,
+            {chunk.chunk_id for chunk in chunks},
+            call_id=call.call_id,
+            extractor="fixture",
+        )
+
+        self.assertEqual(portable_rows, runtime_rows)
+        response_schema = derive_response_schema(specs)
+        item_schema = response_schema["properties"]["fields"]["items"]["anyOf"][0]
+        self.assertEqual(item_schema["properties"]["name"]["enum"], ["compliance_requirement"])
+        self.assertEqual(item_schema["properties"]["value"]["items"]["enum"], ["sso", "audit_logs"])
+
+    def test_llm_schema_inducer_uses_strict_structured_output_when_supported(self) -> None:
+        calls = sample_call_records()[:1]
+        chunks = build_chunks(calls)
+        schema_payload = {
+            "fields": [
+                {
+                    "name": "compliance_requirement",
+                    "type": "list",
+                    "description": "Compliance or governance requirements mentioned by the customer.",
+                    "allowed_values": ["sso"],
+                    "downstream_use_cases": ["filtering"],
+                    "filterable": True,
+                    "facetable": True,
+                    "aggregatable": True,
+                }
+            ]
+        }
+        client = SchemaAwareFakeJSONClient(schema_payload)
+
+        specs = LLMSchemaInducer(client).induce_schema(calls, chunks)
+
+        self.assertEqual([spec.name for spec in specs], ["compliance_requirement"])
+        self.assertEqual(client.response_format["type"], "json_schema")
+        self.assertTrue(client.response_format["strict"])
+        item_schema = client.response_format["schema"]["properties"]["fields"]["items"]
+        self.assertEqual(item_schema["properties"]["type"]["enum"], ["list", "enum", "boolean", "string"])
+        self.assertFalse(item_schema["additionalProperties"])
+
     def test_usage_summary_accumulates_llm_schema_and_extraction_calls(self) -> None:
         calls = sample_call_records()[:1]
         schema_client = FakeJSONClient(
@@ -443,6 +534,14 @@ class FakeJSONClient:
                 output_tokens=self.usage["output_tokens"],
             )
         return self.payload
+
+
+class SchemaAwareFakeJSONClient(FakeJSONClient):
+    supports_json_schema = True
+
+    def complete_json_with_schema(self, *, system, user, response_format):
+        self.response_format = response_format
+        return self.complete_json(system=system, user=user)
 
 
 class ConcurrencyProbeClient:

@@ -24,6 +24,15 @@ class JSONChatClient(Protocol):
     def complete_json(self, *, system: str, user: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    def complete_json_with_schema(
+        self,
+        *,
+        system: str,
+        user: str,
+        response_format: dict[str, Any],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
 
 def empty_call_usage() -> dict[str, Any]:
     return {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "total_cost_usd": 0.0}
@@ -31,6 +40,7 @@ def empty_call_usage() -> dict[str, Any]:
 
 class OpenAIResponsesClient:
     provider_name = "openai"
+    supports_json_schema = True
 
     def __init__(
         self,
@@ -71,6 +81,29 @@ class OpenAIResponsesClient:
         call_usage = self.record_usage(response)
         return parse_json_object(extract_responses_text(response)), call_usage
 
+    def complete_json_with_schema(
+        self,
+        *,
+        system: str,
+        user: str,
+        response_format: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = {
+            "model": self.model,
+            "instructions": system,
+            "input": f"Return JSON only.\n\n{user}",
+            "text": {"format": response_format},
+            "store": False,
+        }
+        response = post_json(
+            f"{self.base_url}/responses",
+            payload,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout_seconds=self.timeout_seconds,
+        )
+        self.record_usage(response)
+        return parse_json_object(extract_responses_text(response))
+
     def record_usage(self, response: dict[str, Any]) -> dict[str, Any]:
         input_tokens, output_tokens, total_tokens = usage_from_response(response)
         cost_usd = cost_for_tokens(input_tokens, output_tokens, self.pricing)
@@ -103,11 +136,15 @@ class OpenAICompatibleChatClient:
         base_url: str = DEFAULT_OPENAI_BASE_URL,
         api_key: str | None = None,
         timeout_seconds: int = 120,
+        supports_json_schema: bool | None = None,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY")
         self.timeout_seconds = timeout_seconds
+        self.supports_json_schema = (
+            env_flag("OPENAI_COMPATIBLE_JSON_SCHEMA") if supports_json_schema is None else supports_json_schema
+        )
         self.usage_summary = UsageSummary()
         self.pricing = pricing_from_env()
         self._usage_lock = threading.Lock()
@@ -139,6 +176,39 @@ class OpenAICompatibleChatClient:
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"Chat completions response missing message content: {response}") from exc
         return parse_json_object(str(content)), call_usage
+
+    def complete_json_with_schema(
+        self,
+        *,
+        system: str,
+        user: str,
+        response_format: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self.supports_json_schema:
+            return self.complete_json(system=system, user=user)
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {key: value for key, value in response_format.items() if key != "type"},
+            },
+        }
+        response = post_json(
+            f"{self.base_url}/chat/completions",
+            payload,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout_seconds=self.timeout_seconds,
+        )
+        self.record_usage(response)
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMError(f"Chat completions response missing message content: {response}") from exc
+        return parse_json_object(str(content))
 
     def record_usage(self, response: dict[str, Any]) -> dict[str, Any]:
         input_tokens, output_tokens, total_tokens = usage_from_response(response)
@@ -223,3 +293,7 @@ def parse_json_object(content: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise LLMError(f"LLM response must be a JSON object, got {type(payload).__name__}")
     return payload
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}

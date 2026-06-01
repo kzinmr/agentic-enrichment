@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .chunking import build_chunks
+from .contracts import build_extraction_contract
 from .extraction import FieldExtractor, HeuristicFieldExtractor, run_call_extractions
 from .feedback import (
     FeedbackAwareSchemaInducer,
@@ -98,6 +99,7 @@ def analyze_calls(
         schema_specs=schema_specs,
         schema_inducer=inducer.name,
         feedback=feedback,
+        max_chunk_chars=max_chunk_chars,
     )
     manifest["prompt_state"] = prompt_state(inducer, extractor)
     trace.add(
@@ -217,6 +219,7 @@ def analyze_calls(
     }
     quality_report = build_quality_report(schema_specs, extractions, total_calls=len(calls))
     promoted_specs = promoted_fields(schema_specs, quality_report)
+    extraction_contract = build_extraction_contract(schema_specs, max_chunk_chars=max_chunk_chars)
     silver_calls = materialize_silver_calls(calls, promoted_specs, extractions)
     catalog = build_silver_schema_catalog(promoted_specs, quality_report)
     databricks_contract = build_databricks_contract(source_sql, catalog)
@@ -242,8 +245,9 @@ def analyze_calls(
     return ContentUnderstandingArtifact(
         manifest=manifest,
         chunks=chunks,
-        field_specs=promoted_specs,
+        field_specs=schema_specs,
         extractions=extractions,
+        extraction_contract=extraction_contract,
         quality_report=quality_report,
         feedback_report=feedback_report,
         silver_schema_catalog=catalog,
@@ -342,6 +346,7 @@ def build_manifest(
     schema_specs: list[FieldSpec],
     schema_inducer: str,
     feedback: FeedbackSummary,
+    max_chunk_chars: int,
 ) -> dict[str, Any]:
     chunk_ids_by_call: dict[str, list[str]] = {}
     for chunk in chunks:
@@ -357,6 +362,16 @@ def build_manifest(
         },
         "record_count": len(calls),
         "chunk_count": len(chunks),
+        "chunking": {
+            "algorithm": "turn_window_max_chars",
+            "max_chunk_chars": max_chunk_chars,
+            "chunk_id_format": "{call_id}:chunk-{index:03d}",
+        },
+        "portable_extraction": {
+            "contract": "extraction_contract.json",
+            "runtime_module": "portable_extractor",
+            "input_artifacts": ["field_specs.jsonl", "chunks.jsonl"],
+        },
         "schema_induction": {
             "inducer": schema_inducer,
             "field_count": len(schema_specs),

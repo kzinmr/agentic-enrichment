@@ -4,6 +4,7 @@ from collections import Counter
 import re
 from typing import Any, Protocol
 
+from .contracts import schema_induction_output_metadata, schema_induction_response_format
 from .fields import FIELD_SPECS
 from .llm import JSONChatClient, LLMError
 from .models import CallRecord, Chunk, FieldSpec
@@ -116,13 +117,29 @@ class LLMSchemaInducer:
 
     def induce_schema(self, calls: list[CallRecord], chunks: list[Chunk]) -> list[FieldSpec]:
         prompt = build_schema_prompt_render(calls, chunks, self.max_fields, self.max_values_per_field)
-        self.last_prompt = prompt.metadata()
+        response_format = schema_induction_response_format()
+        self.last_prompt = {
+            **prompt.metadata(),
+            "structured_output": {"mode": "json_object"},
+            "output_contract": schema_induction_output_metadata(),
+        }
         try:
-            payload = self.llm.complete_json(system=prompt.system, user=prompt.user)
+            complete_with_schema = getattr(self.llm, "complete_json_with_schema", None)
+            use_strict = callable(complete_with_schema) and bool(getattr(self.llm, "supports_json_schema", True))
+            if use_strict:
+                self.last_prompt["structured_output"] = {"mode": "json_schema", "strict": True}
+                payload = complete_with_schema(
+                    system=prompt.system,
+                    user=prompt.user,
+                    response_format=response_format,
+                )
+            else:
+                payload = self.llm.complete_json(system=prompt.system, user=prompt.user)
             return validate_schema_payload(
                 payload,
                 max_fields=self.max_fields,
                 max_values_per_field=self.max_values_per_field,
+                schema_enforced=use_strict,
             )
         except (LLMError, ValueError, TypeError) as exc:
             if self.fallback is None:
@@ -181,30 +198,36 @@ def validate_schema_payload(
     *,
     max_fields: int,
     max_values_per_field: int,
+    schema_enforced: bool = False,
 ) -> list[FieldSpec]:
-    raw_fields = payload.get("fields")
-    if not isinstance(raw_fields, list):
-        raise ValueError("Schema induction response must contain a fields array")
+    raw_fields = schema_enforced_fields(payload) if schema_enforced else json_object_fields(payload)
     specs: list[FieldSpec] = []
     seen: set[str] = set()
     for raw in raw_fields:
-        if not isinstance(raw, dict):
+        if not schema_enforced and not isinstance(raw, dict):
             continue
-        name = normalize_label(str(raw.get("name", "")))
+        if not isinstance(raw, dict):
+            raise ValueError("Schema-enforced induction field must be an object")
+        name = normalize_label(str(raw["name"] if schema_enforced else raw.get("name", "")))
         if not name or name in seen or name in RESERVED_FIELD_NAMES:
             continue
-        field_type = str(raw.get("type", "")).strip().lower()
-        if field_type not in {"list", "enum", "boolean", "string"}:
+        field_type = str(raw["type"] if schema_enforced else raw.get("type", "")).strip().lower()
+        if not schema_enforced and field_type not in {"list", "enum", "boolean", "string"}:
             continue
-        description = str(raw.get("description", "")).strip()
+        description = str(raw["description"] if schema_enforced else raw.get("description", "")).strip()
         if not description:
             description = f"Induced field `{name}`."
-        allowed_values = normalize_allowed_values(raw.get("allowed_values", []), limit=max_values_per_field)
+        allowed_values = normalize_allowed_values(
+            raw["allowed_values"] if schema_enforced else raw.get("allowed_values", []),
+            limit=max_values_per_field,
+        )
         if field_type in {"list", "enum"} and not allowed_values:
             continue
         if field_type == "enum" and "not_mentioned" not in allowed_values:
             allowed_values.insert(0, "not_mentioned")
-        use_cases = normalize_use_cases(raw.get("downstream_use_cases", []))
+        use_cases = normalize_use_cases(
+            raw["downstream_use_cases"] if schema_enforced else raw.get("downstream_use_cases", [])
+        )
         specs.append(
             FieldSpec(
                 name=name,
@@ -212,9 +235,11 @@ def validate_schema_payload(
                 description=description,
                 allowed_values=allowed_values,
                 downstream_use_cases=use_cases,
-                filterable=bool(raw.get("filterable", True)),
-                facetable=bool(raw.get("facetable", field_type != "string")),
-                aggregatable=bool(raw.get("aggregatable", field_type != "string")),
+                filterable=bool(raw["filterable"] if schema_enforced else raw.get("filterable", True)),
+                facetable=bool(raw["facetable"] if schema_enforced else raw.get("facetable", field_type != "string")),
+                aggregatable=bool(
+                    raw["aggregatable"] if schema_enforced else raw.get("aggregatable", field_type != "string")
+                ),
             )
         )
         seen.add(name)
@@ -223,6 +248,20 @@ def validate_schema_payload(
     if not specs:
         raise ValueError("Schema induction produced no valid fields")
     return specs
+
+
+def schema_enforced_fields(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_fields = payload.get("fields")
+    if not isinstance(raw_fields, list):
+        raise ValueError("Structured schema induction response must contain a fields array")
+    return raw_fields
+
+
+def json_object_fields(payload: dict[str, Any]) -> list[Any]:
+    raw_fields = payload.get("fields")
+    if not isinstance(raw_fields, list):
+        raise ValueError("Schema induction response must contain a fields array")
+    return raw_fields
 
 
 def top_labels(chunks: list[Chunk], *, max_values: int) -> list[str]:

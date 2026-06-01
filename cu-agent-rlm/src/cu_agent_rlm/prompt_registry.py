@@ -44,7 +44,7 @@ def prompt_hash(system: str, user: str) -> str:
 def schema_induction_prompt(max_fields: int, max_values_per_field: int) -> PromptSpec:
     return PromptSpec(
         prompt_id="cu.schema_induction",
-        version="2026-05-29.1",
+        version="2026-06-02.1",
         role="schema_inducer",
         system=f"""You are a data-understanding schema designer.
 Induce a reusable silver schema from call records. The schema must be useful for downstream search, filtering, aggregation, and evidence-backed analysis.
@@ -60,8 +60,7 @@ Return only a JSON object with this shape:
       "downstream_use_cases": ["filtering", "aggregation"],
       "filterable": true,
       "facetable": true,
-      "aggregatable": true,
-      "rationale": "short evidence-backed reason"
+      "aggregatable": true
     }}
   ]
 }}

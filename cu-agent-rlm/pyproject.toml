@@ -9,9 +9,12 @@ dependencies = []
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["portable_extractor"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [project.scripts]
 cu-agent-rlm = "cu_agent_rlm.cli:main"
-

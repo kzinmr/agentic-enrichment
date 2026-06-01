@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 import time
 from typing import Any, Protocol
 
+from portable_extractor import build_user_payload, validate as portable_validate
+
 from .fields import extract_call_fields, extract_field, next_action, urgency
 from .llm import JSONChatClient, LLMError, empty_call_usage
 from .models import CallRecord, Chunk, FieldExtraction, FieldSpec
@@ -240,43 +242,7 @@ def build_extraction_prompt_render(
     chunks: list[Chunk],
     specs: list[FieldSpec],
 ) -> PromptRender:
-    return FIELD_EXTRACTION_PROMPT.render(
-        {
-            "call": {
-                "call_id": call.call_id,
-                "customer_id": call.customer_id,
-                "account_name": call.account_name,
-                "date": call.date,
-                "metadata": {
-                    "type": call.metadata.get("type"),
-                    "is_connected": call.metadata.get("is_connected"),
-                    "is_effective_connected": call.metadata.get("is_effective_connected"),
-                    "best_texts_length": call.metadata.get("best_texts_length"),
-                },
-            },
-            "fields": [
-                {
-                    "name": spec.name,
-                    "type": spec.type,
-                    "description": spec.description,
-                    "allowed_values": spec.allowed_values,
-                    "downstream_use_cases": spec.downstream_use_cases,
-                }
-                for spec in specs
-            ],
-            "chunks": [
-                {
-                    "chunk_id": chunk.chunk_id,
-                    "evidence_ref": f"chunk:{chunk.chunk_id}",
-                    "turn_start": chunk.turn_start,
-                    "turn_end": chunk.turn_end,
-                    "speaker_set": chunk.speaker_set,
-                    "text": chunk.text,
-                }
-                for chunk in chunks
-            ],
-        }
-    )
+    return FIELD_EXTRACTION_PROMPT.render(build_user_payload(specs, chunks, call=call))
 
 
 def validate_extraction_payload(
@@ -287,31 +253,14 @@ def validate_extraction_payload(
     specs: list[FieldSpec],
     extractor: str,
 ) -> list[FieldExtraction]:
-    raw_fields = payload.get("fields")
-    if not isinstance(raw_fields, list):
-        raise ValueError("LLM extraction response must contain a fields array")
-
-    spec_by_name = {spec.name: spec for spec in specs}
-    chunk_refs = {f"chunk:{chunk.chunk_id}" for chunk in chunks}
-    raw_by_name: dict[str, dict[str, Any]] = {}
-    for item in raw_fields:
-        if not isinstance(item, dict):
-            raise ValueError("Each LLM field extraction must be an object")
-        name = item.get("name")
-        if not isinstance(name, str):
-            raise ValueError("Each LLM field extraction needs a string name")
-        if name not in spec_by_name:
-            continue
-        raw_by_name[name] = item
-
-    results: list[FieldExtraction] = []
-    for spec in specs:
-        item = raw_by_name.get(spec.name)
-        if item is None:
-            results.append(default_extraction(call, spec, validation_errors=[f"{extractor}:missing_field"]))
-            continue
-        results.append(validate_field_item(item, call=call, spec=spec, chunk_refs=chunk_refs, extractor=extractor))
-    return results
+    rows = portable_validate(
+        payload,
+        specs,
+        {chunk.chunk_id for chunk in chunks},
+        call_id=call.call_id,
+        extractor=extractor,
+    )
+    return [FieldExtraction(**row) for row in rows]
 
 
 def generic_extract_field(call: CallRecord, chunks: list[Chunk], spec: FieldSpec) -> FieldExtraction:
