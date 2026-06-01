@@ -370,6 +370,34 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertTrue(result["column_requests"])
             self.assertIn("Search diagnostics", result["column_requests"][0]["reason"])
 
+    def test_failed_plan_observation_can_replan_without_dropping_cu_field_proposal(self) -> None:
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "corpus"
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            planner = ObservedReplanPlanner()
+            agent = QueryUnderstandingAgent(
+                SilverCorpus.from_dir(output),
+                planner=planner,
+                max_plan_iterations=2,
+            )
+
+            result = agent.answer("Which calls mention security review or access controls?", limit=2)
+
+            self.assertEqual(result["plan"]["operation"], "filter")
+            self.assertEqual(result["plan"]["filters"], {"security_review_requested": True})
+            self.assertEqual(len(result["plan_iterations"]), 2)
+            self.assertTrue(result["records"])
+            self.assertTrue(result["column_requests"])
+            trace_tools = [event["tool"] for event in result["trace"]]
+            self.assertIn("plan_observation", trace_tools)
+            self.assertIn("replan_query:observed-static", trace_tools)
+            self.assertEqual(len(planner.observations), 1)
+            self.assertIn("no_records", planner.observations[0]["judgement"]["failure_modes"])
+            self.assertTrue(planner.observations[0]["column_requests"])
+
     def test_llm_answer_judge_can_emit_feedback_without_planner_column_request(self) -> None:
         sample = workspace / "data" / "sample_calls.jsonl"
         source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
@@ -686,6 +714,42 @@ class FanoutSearchPlanner:
                 ),
                 QueryToolStep(tool="fetch_chunks", arguments={"limit": 5}, purpose="Fetch evidence."),
             ],
+        )
+
+
+class ObservedReplanPlanner:
+    name = "observed-static"
+
+    def __init__(self):
+        self.observations = []
+
+    def plan(self, query, catalog):
+        del catalog
+        return QueryPlan(
+            operation="search",
+            ranking_query="nonexistent terminology",
+            planner=self.name,
+            reasoning="First attempt intentionally misses so observation can drive replanning.",
+            steps=[
+                QueryToolStep(
+                    tool="bm25_search_chunks",
+                    arguments={"query": "nonexistent terminology", "limit": 3, "promote_records": True},
+                    purpose="Initial brittle retrieval attempt.",
+                ),
+                QueryToolStep(tool="fetch_chunks", arguments={"limit": 3}, purpose="Fetch evidence if any exists."),
+                QueryToolStep(tool="review_schema_gaps", arguments={}, purpose="Capture CU feedback from failure."),
+            ],
+        )
+
+    def replan(self, query, catalog, observation):
+        del query, catalog
+        self.observations.append(observation)
+        return QueryPlan(
+            operation="filter",
+            filters={"security_review_requested": True},
+            ranking_query="security review access controls",
+            planner=self.name,
+            reasoning="Observation showed no records, so use the available security silver field.",
         )
 
 

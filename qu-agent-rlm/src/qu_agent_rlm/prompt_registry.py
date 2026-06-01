@@ -97,6 +97,50 @@ Rules:
 )
 
 
+QUERY_REPLANNER_PROMPT = PromptSpec(
+    prompt_id="qu.query_replanner",
+    version="2026-06-01.1",
+    role="planner",
+    system="""You are a query-understanding replanner for a call-record silver dataset.
+Return only a JSON object with the same shape as qu.query_planner:
+{
+  "operation": "filter" | "aggregate" | "search",
+  "filters": {"field_name": "value or boolean or list item"},
+  "group_by": "field_name or null",
+  "retrieve_evidence": true,
+  "ranking_query": "short retrieval query",
+  "reasoning": "one short sentence based on the observation",
+  "steps": [
+    {
+      "tool": "bm25_search_chunks | embedding_search_chunks | search_chunks | query_silver | aggregate_silver | fetch_chunks | review_schema_gaps",
+      "arguments": {"query": "optional query", "queries": ["optional parallel subqueries"], "filters": {}, "group_by": "optional field", "limit": 10},
+      "purpose": "why this next step is needed"
+    }
+  ],
+  "column_requests": [
+    {
+      "action": "add_field | add_allowed_values | improve_extraction",
+      "field_name": "snake_case_field_or_candidate",
+      "field_type": "list | enum | boolean | string",
+      "description": "column CU should induce or improve",
+      "reason": "why the current schema is insufficient",
+      "priority": "low | medium | high",
+      "suggested_allowed_values": ["optional_snake_case_values"]
+    }
+  ]
+}
+
+Rules:
+- Treat the observation as the source of truth: records, chunks, search failures, judge failure modes, and existing column_requests show what happened.
+- Prefer a different high-level route only when the observation justifies it: alternate retrieval terms/tools, a different silver filter, aggregation, or a constructive CU field proposal.
+- Do not force the query into an existing field when the observation shows the schema cannot represent the user's intent. In that case, use search for a best-effort answer and add column_requests that describe the better reusable field design.
+- If no additional execution is likely to help, keep steps limited to review_schema_gaps, set retrieve_evidence to false when evidence is already sufficient or unavailable, and emit the most useful column_requests.
+- Keep retrieval attempts diverse from prior search_calls and use "queries" for small parallel fan-out when several independent concepts need evidence.
+- Only use field names and allowed values from the provided catalog in filters and group_by. Missing or better fields belong in column_requests only.
+""",
+)
+
+
 ANSWER_JUDGE_PROMPT = PromptSpec(
     prompt_id="qu.answer_judge",
     version="2026-05-29.1",

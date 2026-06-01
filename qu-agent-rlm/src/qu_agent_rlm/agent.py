@@ -42,6 +42,7 @@ class QueryUnderstandingAgent:
         max_errors: int = 3,
         max_budget_usd: float | None = None,
         max_timeout_seconds: float | None = None,
+        max_plan_iterations: int = 2,
     ) -> None:
         self.corpus = corpus
         # Bare constructor defaults are for smoke tests; CLI/demo callers inject LLM-first components.
@@ -54,6 +55,7 @@ class QueryUnderstandingAgent:
         self.max_errors = max_errors
         self.max_budget_usd = max_budget_usd
         self.max_timeout_seconds = max_timeout_seconds
+        self.max_plan_iterations = max(1, max_plan_iterations)
         self.retrieval_subagent = retrieval_subagent or AgenticRetrievalSubAgent(
             controller=search_controller,
             reranker=reranker,
@@ -67,12 +69,6 @@ class QueryUnderstandingAgent:
             max_budget_usd=self.max_budget_usd,
             max_timeout_seconds=self.max_timeout_seconds,
         )
-        before_usage = self.usage_summary()
-        plan_started = time.perf_counter()
-        plan = self.planner.plan(query, self.corpus.catalog)
-        plan_tokens = usage_delta(self.usage_summary(), before_usage)
-        if not plan.steps:
-            plan.steps = default_steps_for_plan(plan)
         trace.append(
             ToolEvent(
                 step=1,
@@ -81,34 +77,177 @@ class QueryUnderstandingAgent:
                 result_summary=f"{len(self.corpus.fields)} fields available",
             )
         )
+        state = initial_query_state()
+        observation: dict[str, Any] | None = None
+        plan_iterations: list[dict[str, Any]] = []
+        plan: QueryPlan | None = None
+        answer = ""
+        records: list[dict[str, Any]] = []
+        aggregation: dict[str, int] = {}
+        evidence: list[dict[str, Any]] = []
+        column_requests: list[ColumnRequest] = []
+        judgement: dict[str, Any] = {}
+
+        for iteration in range(self.max_plan_iterations):
+            if iteration > 0 and not planner_supports_replan(self.planner):
+                break
+            plan = self.plan_query_iteration(query, iteration=iteration, observation=observation, trace=trace)
+            state["column_requests"] = merge_column_requests([*state["column_requests"], *plan.column_requests])
+            plan_iterations.append(
+                {
+                    "iteration": iteration,
+                    "plan": asdict(plan),
+                    "observation": compact_replan_observation(observation),
+                }
+            )
+            self.execute_plan_iteration(
+                plan,
+                query=query,
+                state=state,
+                limit=limit,
+                trace=trace,
+                guardrails=guardrails,
+                iteration=iteration,
+            )
+            self.finalize_retrieval_iteration(
+                plan,
+                query=query,
+                state=state,
+                limit=limit,
+                trace=trace,
+                guardrails=guardrails,
+                iteration=iteration,
+            )
+            self.prepare_state_for_answer(
+                plan,
+                query=query,
+                state=state,
+                limit=limit,
+                trace=trace,
+                guardrails=guardrails,
+                iteration=iteration,
+            )
+            answer, records, aggregation, evidence, column_requests, judgement = self.evaluate_answer(
+                plan,
+                query=query,
+                state=state,
+                limit=limit,
+                trace=trace,
+                guardrails=guardrails,
+                iteration=iteration,
+            )
+            plan_iterations[-1]["judgement"] = compact_judgement_for_observation(judgement)
+            plan_iterations[-1]["best_partial_answer"] = best_partial_answer(records, aggregation, evidence)
+            if guardrails.stopped or judgement.get("success") or iteration + 1 >= self.max_plan_iterations:
+                break
+            if not planner_supports_replan(self.planner):
+                break
+            observation = build_plan_observation(
+                plan=plan,
+                answer=answer,
+                records=records,
+                aggregation=aggregation,
+                evidence=evidence,
+                state=state,
+                column_requests=column_requests,
+                judgement=judgement,
+                guardrails=guardrails,
+            )
+            trace.append(
+                ToolEvent(
+                    step=len(trace) + 1,
+                    tool="plan_observation",
+                    arguments={
+                        "iteration": iteration,
+                        "next_iteration": iteration + 1,
+                        "failure_modes": judgement.get("failure_modes", []),
+                        "record_count": len(records),
+                        "evidence_count": len(evidence),
+                        "column_request_count": len(column_requests),
+                    },
+                    result_summary="Observed answer quality and state before replanning.",
+                    validation_result="ok",
+                )
+            )
+
+        if plan is None:
+            raise RuntimeError("Query planner did not produce a plan.")
+
+        return result_payload(
+            query,
+            plan,
+            answer,
+            records,
+            aggregation,
+            evidence,
+            trace,
+            column_requests,
+            search_calls=state["search_calls"],
+            search_failures=state["search_failures"],
+            rerank=state["rerank"],
+            judgement=judgement,
+            retrieval_subagent=self.retrieval_subagent.name,
+            prompt_state=self.prompt_state(judgement, state),
+            usage_summary=self.usage_summary(),
+            guardrails=guardrails.to_dict(),
+            best_partial_answer=best_partial_answer(records, aggregation, evidence),
+            plan_iterations=plan_iterations,
+        )
+
+    def plan_query_iteration(
+        self,
+        query: str,
+        *,
+        iteration: int,
+        observation: dict[str, Any] | None,
+        trace: list[ToolEvent],
+    ) -> QueryPlan:
+        before_usage = self.usage_summary()
+        started = time.perf_counter()
+        if iteration == 0:
+            plan = self.planner.plan(query, self.corpus.catalog)
+            tool_name = "plan_query"
+        else:
+            replan = getattr(self.planner, "replan", None)
+            if not callable(replan):
+                raise RuntimeError("Planner does not support contextual replanning.")
+            plan = replan(query, self.corpus.catalog, observation or {})
+            tool_name = "replan_query"
+        plan_tokens = usage_delta(self.usage_summary(), before_usage)
+        if not plan.steps:
+            plan.steps = default_steps_for_plan(plan)
         trace.append(
             ToolEvent(
-                step=2,
-                tool=f"plan_query:{plan.planner}",
-                arguments={"query": query},
+                step=len(trace) + 1,
+                tool=f"{tool_name}:{plan.planner}",
+                arguments={
+                    "query": query,
+                    "iteration": iteration,
+                    "observation": compact_replan_observation(observation),
+                },
                 result_summary=(
                     f"operation={plan.operation} filters={plan.filters} "
                     f"group_by={plan.group_by} steps={len(plan.steps)} reasoning={plan.reasoning}"
                 ),
-                latency_ms=elapsed_ms(plan_started),
+                latency_ms=elapsed_ms(started),
                 tokens=plan_tokens,
                 prompt_hash=prompt_hash_from_component(self.planner),
                 validation_result="ok",
             )
         )
+        return plan
 
-        state: dict[str, Any] = {
-            "records": [],
-            "chunks": [],
-            "aggregation": {},
-            "evidence": [],
-            "column_requests": list(plan.column_requests),
-            "search_calls": [],
-            "search_failures": [],
-            "rerank": {},
-            "retrieval_prompt": {},
-            "reranker_prompt": {},
-        }
+    def execute_plan_iteration(
+        self,
+        plan: QueryPlan,
+        *,
+        query: str,
+        state: dict[str, Any],
+        limit: int,
+        trace: list[ToolEvent],
+        guardrails: "GuardrailState",
+        iteration: int,
+    ) -> None:
         for step in plan.steps:
             stop_reason = guardrails.stop_reason(self.usage_summary())
             if stop_reason:
@@ -118,7 +257,13 @@ class QueryUnderstandingAgent:
                 step_started = time.perf_counter()
                 trace_len_before = len(trace)
                 self.execute_step(step, query=query, plan=plan, state=state, limit=limit, trace=trace)
-                annotate_new_events(trace, trace_len_before, latency_ms=elapsed_ms(step_started), tokens={})
+                annotate_new_events(
+                    trace,
+                    trace_len_before,
+                    latency_ms=elapsed_ms(step_started),
+                    tokens={},
+                    plan_iteration=iteration,
+                )
                 guardrails.record_success()
             except (ValueError, TypeError) as exc:
                 guardrails.record_error()
@@ -126,7 +271,7 @@ class QueryUnderstandingAgent:
                     ToolEvent(
                         step=len(trace) + 1,
                         tool="execute_step:error",
-                        arguments={"tool": step.tool, "purpose": step.purpose},
+                        arguments={"tool": step.tool, "purpose": step.purpose, "plan_iteration": iteration},
                         result_summary=str(exc)[:240],
                         fallback_reason=str(exc)[:240],
                         validation_result="error",
@@ -157,6 +302,7 @@ class QueryUnderstandingAgent:
                     latency_ms=elapsed_ms(retrieval_started),
                     tokens=retrieval_tokens,
                     prompt_hash=prompt_hash_from_component(self.retrieval_subagent),
+                    plan_iteration=iteration,
                 )
                 if trace_error_count(trace) > error_count_before:
                     guardrails.record_error()
@@ -167,6 +313,17 @@ class QueryUnderstandingAgent:
                     append_guardrail_trace(trace, stop_reason)
                     break
 
+    def finalize_retrieval_iteration(
+        self,
+        plan: QueryPlan,
+        *,
+        query: str,
+        state: dict[str, Any],
+        limit: int,
+        trace: list[ToolEvent],
+        guardrails: "GuardrailState",
+        iteration: int,
+    ) -> None:
         if not guardrails.stopped:
             before_usage = self.usage_summary()
             finalize_started = time.perf_counter()
@@ -180,6 +337,7 @@ class QueryUnderstandingAgent:
                 latency_ms=elapsed_ms(finalize_started),
                 tokens=finalize_tokens,
                 prompt_hash=prompt_hash_from_component(self.retrieval_subagent),
+                plan_iteration=iteration,
             )
             if trace_error_count(trace) > error_count_before:
                 guardrails.record_error()
@@ -187,11 +345,23 @@ class QueryUnderstandingAgent:
             if stop_reason:
                 append_guardrail_trace(trace, stop_reason)
 
+    def prepare_state_for_answer(
+        self,
+        plan: QueryPlan,
+        *,
+        query: str,
+        state: dict[str, Any],
+        limit: int,
+        trace: list[ToolEvent],
+        guardrails: "GuardrailState",
+        iteration: int,
+    ) -> None:
         if not state["records"] and state["chunks"]:
             state["records"] = records_for_chunks(self.corpus, state["chunks"])
         elif plan.operation == "search" and state["chunks"]:
             state["records"] = records_for_chunks(self.corpus, state["chunks"])
         if plan.retrieve_evidence and not state["evidence"] and not guardrails.stopped:
+            trace_len_before = len(trace)
             self.execute_step(
                 QueryToolStep(tool="fetch_chunks", arguments={"limit": 8}, purpose="Fetch fallback evidence."),
                 query=query,
@@ -200,7 +370,19 @@ class QueryUnderstandingAgent:
                 limit=limit,
                 trace=trace,
             )
+            annotate_new_events(trace, trace_len_before, latency_ms=0.0, tokens={}, plan_iteration=iteration)
 
+    def evaluate_answer(
+        self,
+        plan: QueryPlan,
+        *,
+        query: str,
+        state: dict[str, Any],
+        limit: int,
+        trace: list[ToolEvent],
+        guardrails: "GuardrailState",
+        iteration: int,
+    ) -> tuple[str, list[dict[str, Any]], dict[str, int], list[dict[str, Any]], list[ColumnRequest], dict[str, Any]]:
         records = state["records"][:limit]
         aggregation = state["aggregation"]
         evidence = state["evidence"]
@@ -241,25 +423,8 @@ class QueryUnderstandingAgent:
                 validation_result="ok",
             )
         )
-        return result_payload(
-            query,
-            plan,
-            answer,
-            records,
-            aggregation,
-            evidence,
-            trace,
-            column_requests,
-            search_calls=state["search_calls"],
-            search_failures=state["search_failures"],
-            rerank=state["rerank"],
-            judgement=judgement,
-            retrieval_subagent=self.retrieval_subagent.name,
-            prompt_state=self.prompt_state(judgement, state),
-            usage_summary=self.usage_summary(),
-            guardrails=guardrails.to_dict(),
-            best_partial_answer=best_partial_answer(records, aggregation, evidence),
-        )
+        trace[-1].arguments["plan_iteration"] = iteration
+        return answer, records, aggregation, evidence, column_requests, judgement
 
     def usage_summary(self) -> dict[str, Any]:
         return usage_summary_from_components(
@@ -513,11 +678,13 @@ def result_payload(
     usage_summary: dict[str, Any],
     guardrails: dict[str, Any],
     best_partial_answer: dict[str, Any],
+    plan_iterations: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
         "query": query,
         "answer": answer,
         "plan": asdict(plan),
+        "plan_iterations": plan_iterations,
         "records": [compact_record(record) for record in records],
         "aggregation": aggregation,
         "evidence": evidence,
@@ -531,6 +698,104 @@ def result_payload(
         "best_partial_answer": best_partial_answer,
         "trace": [asdict(event) for event in trace],
     }
+
+
+def initial_query_state() -> dict[str, Any]:
+    return {
+        "records": [],
+        "chunks": [],
+        "aggregation": {},
+        "evidence": [],
+        "column_requests": [],
+        "search_calls": [],
+        "search_failures": [],
+        "rerank": {},
+        "retrieval_prompt": {},
+        "reranker_prompt": {},
+    }
+
+
+def planner_supports_replan(planner: object) -> bool:
+    return callable(getattr(planner, "replan", None))
+
+
+def build_plan_observation(
+    *,
+    plan: QueryPlan,
+    answer: str,
+    records: list[dict[str, Any]],
+    aggregation: dict[str, int],
+    evidence: list[dict[str, Any]],
+    state: dict[str, Any],
+    column_requests: list[ColumnRequest],
+    judgement: dict[str, Any],
+    guardrails: "GuardrailState",
+) -> dict[str, Any]:
+    return {
+        "previous_plan": asdict(plan),
+        "answer": answer,
+        "judgement": compact_judgement_for_observation(judgement),
+        "records": [compact_record(record) for record in records[:10]],
+        "aggregation": aggregation,
+        "evidence": compact_evidence_for_observation(evidence),
+        "search_calls": summarize_search_calls_for_llm(state["search_calls"]),
+        "search_failures": state["search_failures"][-6:],
+        "candidate_chunks": chunks_for_llm(state["chunks"][:12]),
+        "column_requests": [asdict(request) for request in column_requests],
+        "state_counts": {
+            "record_count": len(records),
+            "chunk_count": len(state["chunks"]),
+            "evidence_count": len(evidence),
+            "aggregation_group_count": len(aggregation),
+            "search_call_count": len(state["search_calls"]),
+            "search_failure_count": len(state["search_failures"]),
+            "column_request_count": len(column_requests),
+        },
+        "guardrails": guardrails.to_dict(),
+        "guidance": (
+            "If the current silver schema cannot express the user's intent, propose constructive "
+            "CU column_requests instead of forcing a weak filter."
+        ),
+    }
+
+
+def compact_replan_observation(observation: dict[str, Any] | None) -> dict[str, Any]:
+    if not observation:
+        return {}
+    return {
+        "failure_modes": observation.get("judgement", {}).get("failure_modes", []),
+        "success": observation.get("judgement", {}).get("success"),
+        "state_counts": observation.get("state_counts", {}),
+        "column_requests": observation.get("column_requests", [])[:4],
+        "search_failures": observation.get("search_failures", [])[:4],
+    }
+
+
+def compact_judgement_for_observation(judgement: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "judge": judgement.get("judge"),
+        "answerable": judgement.get("answerable"),
+        "evidence_sufficient": judgement.get("evidence_sufficient"),
+        "success": judgement.get("success"),
+        "needs_cu_feedback": judgement.get("needs_cu_feedback"),
+        "confidence": judgement.get("confidence"),
+        "failure_modes": judgement.get("failure_modes", []),
+        "rationale": judgement.get("rationale", ""),
+        "metrics": judgement.get("metrics", {}),
+    }
+
+
+def compact_evidence_for_observation(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "chunk_id": item.get("chunk_id"),
+            "call_id": item.get("call_id"),
+            "snippet": item.get("snippet"),
+            "matched_terms": item.get("matched_terms", []),
+            "query_terms": item.get("query_terms", []),
+        }
+        for item in evidence[:8]
+    ]
 
 
 class GuardrailState:
@@ -600,8 +865,11 @@ def annotate_new_events(
     latency_ms: float,
     tokens: dict[str, Any],
     prompt_hash: str | None = None,
+    plan_iteration: int | None = None,
 ) -> None:
     for event in trace[start_index:]:
+        if plan_iteration is not None:
+            event.arguments.setdefault("plan_iteration", plan_iteration)
         if event.latency_ms is None:
             event.latency_ms = latency_ms
         if event.tokens is None:

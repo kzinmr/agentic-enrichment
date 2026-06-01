@@ -114,6 +114,8 @@
 
 ## P2 — ループ駆動（LLM をパラメータ係から orchestrator へ昇格）
 
+> **実装状況（2026-06-01）: T6 ✅ 完了**。QU `answer()` を bounded `plan → execute → judge/observe → replan` ループへ再構成。初回 plan は従来どおり温存し、`replan` 対応 planner（現状 `LLMQueryPlanner`）だけが judge 観測後に次 iteration へ進むため、heuristic/static planner の single-plan 動作は維持。観測には records/chunks/search failures/judge failure modes/既存 `column_requests` を圧縮して渡し、trace に `plan_observation` / `replan_query:*` / `plan_iteration` を記録。CLI/scripts に `--max-plan-iterations`（既定2、1で従来相当）を追加。replanner prompt では「既存フィールドへ無理に押し込まず、より適した CU フィールド設計がある場合は constructive `column_requests` として提案する」方針を明示し、暫定回答と schema feedback の両立を保つ。
+
 ### T6. 観測駆動の外側ループ：plan 凍結を解く（最重要・設計変更大）
 
 - **現状**: `plan = planner.plan(...)` は**冒頭1回のみ**（`agent.py:53`）。以後 `for step in plan.steps`（`agent.py:88`）を回すだけで、**結果を観測して高レベルの手を変える上位ループが無い**。観測駆動は retrieval 内部に閉じ、しかも既定休眠（`max_iterations=0`, `retrieval_agent.py:16`）。
