@@ -116,6 +116,8 @@ class AgenticRetrievalSubAgent:
                             tool="search_iteration:error",
                             arguments={"subagent": self.name, "provider": self.controller.provider_name},
                             result_summary=str(exc)[:240],
+                            fallback_reason=str(exc)[:240],
+                            validation_result="error",
                         )
                     )
                     if len(state["search_calls"]) >= self.policy.min_calls:
@@ -327,6 +329,8 @@ class AgenticRetrievalSubAgent:
                     tool="llm_rerank:error",
                     arguments={"subagent": self.name, "provider": self.reranker.provider_name},
                     result_summary=str(exc)[:240],
+                    fallback_reason=str(exc)[:240],
+                    validation_result="error",
                 )
             )
             return

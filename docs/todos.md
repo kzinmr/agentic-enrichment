@@ -33,6 +33,11 @@
 
 ## P0 — 基盤（即効・低リスク・コードに完全欠落）
 
+> **実装状況（2026-06-01）: T1 ✅ / T2 ✅ / T3 ✅ 完了**。`usage.py`（両パッケージ）・`replay.py`（両パッケージ）・`GuardrailState`（`pipeline.py` / `agent.py`）・CLI/scripts への配線・ユニットテスト追加済み。検証: CU 12/12・QU 20/20 PASS、実データでの end-to-end スモーク通過。
+> - 当初 T2 で未達だった **replay redaction** を実装: `redact_for_replay`（`snippet/text/best_text/transcript/...` を `[redacted]` 化、構造は保持）。QU は各回答に `*.replay.json` を既定出力（`--no-replay` で抑止）、CU は `rlm_trace.replay.jsonl` を出力。
+> - **pricing 可視化**: `budget_unpriced_warning` を全 CLI/scripts で stderr 警告。metrics に `llm_cost_basis`(=`pricing.source`) を追加し、`--max-budget-usd` が価格未設定で no-op になる事象を可視化。
+> - 既存課題だったテストフィクスチャの stale パス（`cu-agent/data/...`）を `data/` 相対へ修正、`call_records.sql` 未追跡に依存しないよう `observed_columns` を SQL 無しでも baseline 列を返す形に変更。
+
 ### T1. LLM 呼び出しのコスト/トークン計測（`UsageSummary` 相当）
 
 - **現状**: コスト・トークン計測が**両パッケージに皆無**（`grep usage|token|cost|budget` のヒットはカタログ metadata とトークナイザのみ）。CU は N コール×1 LLM、QU は agentic 時に検索ループが回るのに可視性ゼロ。

@@ -26,14 +26,15 @@ from qu_agent_rlm.query_tasks import (
     build_heuristic_bootstrap_tasks,
     dedupe_query_tasks,
 )
+from qu_agent_rlm.replay import REDACTED, redact_for_replay
 from qu_agent_rlm.retrieval import BM25Index
-from qu_agent_rlm.usage import UsageSummary
+from qu_agent_rlm.usage import UsageSummary, budget_unpriced_warning
 
 
 class QueryUnderstandingRLMTest(unittest.TestCase):
     def test_filters_aggregate_and_evaluates_cu_artifacts(self) -> None:
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
@@ -62,8 +63,8 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertEqual(eval_report["passed"], eval_report["task_count"])
 
     def test_agent_accepts_injected_planner(self) -> None:
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
@@ -77,8 +78,8 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertTrue(result["records"])
 
     def test_llm_planner_maps_json_to_valid_plan(self) -> None:
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
@@ -109,12 +110,10 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertIn("prompt_hash", result["prompt_state"]["planner"])
 
     def test_usage_summary_accumulates_query_llm_calls(self) -> None:
-        sample = workspace / "legacy" / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
-
         with tempfile.TemporaryDirectory() as tmp:
+            sample = write_sample_calls(Path(tmp) / "sample_calls.jsonl")
             output = Path(tmp) / "corpus"
-            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            run_content_understanding(sample, output, schema_inducer=StaticSchemaInducer())
             planner_client = FakeJSONClient(
                 {
                     "operation": "search",
@@ -160,9 +159,60 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertEqual(usage["by_model"]["fake-planner"]["total_calls"], 1)
             self.assertEqual(usage["by_model"]["fake-judge"]["total_calls"], 1)
 
+    def test_guardrail_timeout_returns_best_partial_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = write_sample_calls(Path(tmp) / "sample_calls.jsonl")
+            output = Path(tmp) / "corpus"
+            run_content_understanding(sample, output, schema_inducer=StaticSchemaInducer())
+            agent = QueryUnderstandingAgent(
+                SilverCorpus.from_dir(output),
+                max_timeout_seconds=0,
+            )
+
+            result = agent.answer("Which calls mention security review?", limit=2)
+
+            self.assertTrue(result["guardrails"]["stopped"])
+            self.assertEqual(result["guardrails"]["stop_reason"], "timeout")
+            self.assertIn("timeout", result["judgement"]["failure_modes"])
+            self.assertIn("guardrail_stop", [event["tool"] for event in result["trace"]])
+            self.assertEqual(result["best_partial_answer"]["record_count"], 0)
+
+    def test_redact_for_replay_strips_answer_snippets(self) -> None:
+        answer = {
+            "query": "Which calls mention security review?",
+            "records": [{"call_id": "c1", "fields": {"security_review_requested": True}}],
+            "evidence": [{"chunk_id": "c1:0", "call_id": "c1", "snippet": "raw transcript text", "bm25_score": 1.2}],
+            "search_diagnostics": {"calls": [{"tool": "bm25", "top_chunks": [{"chunk_id": "c1:0", "snippet": "more raw text"}]}]},
+        }
+        redacted = redact_for_replay(answer)
+        self.assertEqual(redacted["query"], answer["query"])  # the query itself is preserved
+        self.assertEqual(redacted["records"][0]["fields"]["security_review_requested"], True)
+        self.assertEqual(redacted["evidence"][0]["snippet"], REDACTED)
+        self.assertEqual(redacted["evidence"][0]["bm25_score"], 1.2)
+        self.assertEqual(redacted["search_diagnostics"]["calls"][0]["top_chunks"][0]["snippet"], REDACTED)
+        self.assertEqual(answer["evidence"][0]["snippet"], "raw transcript text")  # original untouched
+
+    def test_budget_unpriced_warning(self) -> None:
+        keys = ("OPENAI_INPUT_USD_PER_MTOK", "OPENAI_OUTPUT_USD_PER_MTOK")
+        previous = {key: os.environ.get(key) for key in keys}
+        try:
+            for key in keys:
+                os.environ.pop(key, None)
+            self.assertIsNone(budget_unpriced_warning(None))
+            self.assertIsNotNone(budget_unpriced_warning(2.5))
+            os.environ["OPENAI_INPUT_USD_PER_MTOK"] = "0.15"
+            os.environ["OPENAI_OUTPUT_USD_PER_MTOK"] = "0.60"
+            self.assertIsNone(budget_unpriced_warning(2.5))
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_search_only_query_emits_column_request_for_cu_feedback(self) -> None:
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "corpus"
@@ -186,8 +236,8 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertIn("judgement", feedback_payload)
 
     def test_embedding_search_tool_is_agent_callable(self) -> None:
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "corpus"
@@ -201,8 +251,8 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertIn("embedding_search_chunks", [event["tool"] for event in result["trace"]])
 
     def test_search_iteration_rejects_duplicate_and_reranks_candidates(self) -> None:
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "corpus"
@@ -246,8 +296,8 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertGreaterEqual(len(result["search_diagnostics"]["calls"]), 2)
 
     def test_agent_accepts_specialized_retrieval_subagent(self) -> None:
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "corpus"
@@ -266,8 +316,8 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertEqual(result["search_diagnostics"]["subagent"], "sid1-fixture")
 
     def test_search_failure_generates_schema_gap_request(self) -> None:
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "corpus"
@@ -284,8 +334,8 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertIn("Search diagnostics", result["column_requests"][0]["reason"])
 
     def test_llm_answer_judge_can_emit_feedback_without_planner_column_request(self) -> None:
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
         judge_payload = {
             "answerable": True,
             "evidence_sufficient": True,
@@ -335,8 +385,8 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             )
 
     def test_heuristic_planner_uses_feedback_refined_fields(self) -> None:
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
         feedback_payload = {
             "query": "Which calls mention founder-led sales calls?",
             "column_requests": [
@@ -668,6 +718,37 @@ class FakeSequenceJSONClient:
         if not self.payloads:
             return {"action": "stop"}
         return self.payloads.pop(0)
+
+
+def write_sample_calls(path: Path) -> Path:
+    rows = [
+        {
+            "call_id": "call-001",
+            "customer_id": "cust-001",
+            "account_name": "Acme",
+            "date": "2026-01-01",
+            "calllog_result": [
+                {
+                    "speaker": "customer",
+                    "best_text": "We need SSO and audit logs for security review.",
+                }
+            ],
+        },
+        {
+            "call_id": "call-002",
+            "customer_id": "cust-002",
+            "account_name": "Beta",
+            "date": "2026-01-02",
+            "calllog_result": [
+                {
+                    "speaker": "customer",
+                    "best_text": "Pricing is blocking renewal.",
+                }
+            ],
+        },
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    return path
 
 
 if __name__ == "__main__":

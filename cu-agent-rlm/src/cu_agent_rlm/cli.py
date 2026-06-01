@@ -12,9 +12,12 @@ from .llm import (
     OpenAICompatibleChatClient,
     OpenAIResponsesClient,
 )
+import sys
+
 from .pipeline import run_content_understanding
 from .prompt_repair import write_prompt_repair_requests
 from .schema import HeuristicSchemaInducer, LLMSchemaInducer, SchemaInducer
+from .usage import budget_unpriced_warning
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--llm-api-key", default=None)
     parser.add_argument("--llm-timeout-seconds", type=int, default=120)
+    parser.add_argument("--max-errors", type=int, default=3)
+    parser.add_argument("--max-budget-usd", type=float, default=None)
+    parser.add_argument("--max-timeout-seconds", type=float, default=None)
     return parser
 
 
@@ -75,6 +81,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    budget_warning = budget_unpriced_warning(args.max_budget_usd)
+    if budget_warning:
+        print(f"WARNING: {budget_warning}", file=sys.stderr)
     source_sql = args.source_sql
     if source_sql and not source_sql.exists():
         raise FileNotFoundError(f"Source SQL file not found: {source_sql}")
@@ -86,6 +95,9 @@ def main() -> int:
         schema_inducer=build_schema_inducer(args),
         field_extractor=build_extractor(args),
         feedback_input=args.feedback_input,
+        max_errors=args.max_errors,
+        max_budget_usd=args.max_budget_usd,
+        max_timeout_seconds=args.max_timeout_seconds,
     )
     promoted_count = len(artifact.silver_schema_catalog["fields"])
     print(f"Wrote CU RLM artifacts to {args.output}")

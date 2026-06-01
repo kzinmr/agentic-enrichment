@@ -10,20 +10,22 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from cu_agent_rlm.cli import parse_args
+from cu_agent_rlm.extraction import ExtractionError, LLMFieldExtractor
 from cu_agent_rlm.pipeline import run_content_understanding
-from cu_agent_rlm.extraction import LLMFieldExtractor
 from cu_agent_rlm.io import load_calls
 from cu_agent_rlm.llm import DEFAULT_OPENAI_MODEL
+from cu_agent_rlm.models import CallRecord, TranscriptTurn
 from cu_agent_rlm.pipeline import analyze_calls
+from cu_agent_rlm.replay import REDACTED, redact_for_replay
 from cu_agent_rlm.schema import LLMSchemaInducer, StaticSchemaInducer
-from cu_agent_rlm.usage import UsageSummary
+from cu_agent_rlm.usage import UsageSummary, budget_unpriced_warning
 
 
 class ContentUnderstandingRLMTest(unittest.TestCase):
     def test_sample_call_records_generate_silver_contract(self) -> None:
         workspace = Path(__file__).resolve().parents[2]
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
@@ -55,8 +57,8 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
 
     def test_qu_feedback_refines_schema_induction(self) -> None:
         workspace = Path(__file__).resolve().parents[2]
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
 
         feedback_payload = {
             "query": "Which calls mention founder-led sales calls?",
@@ -109,8 +111,8 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
 
     def test_answerability_judgement_feedback_refines_schema_induction(self) -> None:
         workspace = Path(__file__).resolve().parents[2]
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
-        source_sql = workspace / "call_records.sql"
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
 
         feedback_payload = {
             "query": "Which calls mention founder-led sales calls?",
@@ -158,7 +160,7 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
 
     def test_llm_extractor_validates_json_against_schema_and_evidence(self) -> None:
         workspace = Path(__file__).resolve().parents[2]
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        sample = workspace / "data" / "sample_calls.jsonl"
         calls = load_calls(sample)[:1]
         payload = {
             "fields": [
@@ -197,7 +199,7 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
 
     def test_llm_schema_inducer_drives_extraction_schema(self) -> None:
         workspace = Path(__file__).resolve().parents[2]
-        sample = workspace / "cu-agent" / "data" / "sample_calls.jsonl"
+        sample = workspace / "data" / "sample_calls.jsonl"
         calls = load_calls(sample)[:1]
         schema_payload = {
             "fields": [
@@ -244,9 +246,7 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
         self.assertIn("prompt_hash", artifact.manifest["prompt_state"]["schema_inducer"])
 
     def test_usage_summary_accumulates_llm_schema_and_extraction_calls(self) -> None:
-        workspace = Path(__file__).resolve().parents[2]
-        sample = workspace / "legacy" / "cu-agent" / "data" / "sample_calls.jsonl"
-        calls = load_calls(sample)[:1]
+        calls = sample_call_records()[:1]
         schema_client = FakeJSONClient(
             {
                 "fields": [
@@ -289,6 +289,70 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
         self.assertEqual(usage["output_tokens"], 50)
         self.assertEqual(usage["by_model"]["fake-schema"]["total_calls"], 1)
         self.assertEqual(usage["by_model"]["fake-extraction"]["total_calls"], 1)
+
+    def test_guardrail_returns_partial_artifact_after_extraction_errors(self) -> None:
+        calls = sample_call_records()[:2]
+
+        artifact = analyze_calls(
+            calls,
+            schema_inducer=StaticSchemaInducer(),
+            field_extractor=FailingFieldExtractor(),
+            max_errors=1,
+        )
+
+        self.assertTrue(artifact.manifest["guardrails"]["stopped"])
+        self.assertEqual(artifact.manifest["guardrails"]["stop_reason"], "max_errors_exceeded")
+        self.assertEqual(artifact.manifest["best_partial_result"]["extracted_field_rows"], 0)
+        self.assertIn("guardrail_stop", [event.tool for event in artifact.trace])
+        error_event = next(event for event in artifact.trace if event.tool == "extract_call_fields")
+        self.assertEqual(error_event.validation_result, "error")
+        self.assertTrue(error_event.fallback_reason)
+
+    def test_redact_for_replay_strips_raw_text_keeps_structure(self) -> None:
+        payload = {
+            "chunk_id": "c1",
+            "snippet": "We need SSO and audit logs.",
+            "score": 0.42,
+            "nested": [{"text": "raw transcript turn", "matched_terms": ["sso"]}],
+            "empty": "",
+        }
+        redacted = redact_for_replay(payload)
+        self.assertEqual(redacted["snippet"], REDACTED)
+        self.assertEqual(redacted["nested"][0]["text"], REDACTED)
+        self.assertEqual(redacted["chunk_id"], "c1")
+        self.assertEqual(redacted["score"], 0.42)
+        self.assertEqual(redacted["nested"][0]["matched_terms"], ["sso"])
+        self.assertEqual(redacted["empty"], "")  # empty values are left as-is, not marked redacted
+        self.assertEqual(payload["snippet"], "We need SSO and audit logs.")  # original untouched
+
+    def test_replay_trace_artifact_written(self) -> None:
+        calls = sample_call_records()[:1]
+        from cu_agent_rlm.io import write_artifact
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            artifact = analyze_calls(calls, schema_inducer=StaticSchemaInducer())
+            write_artifact(artifact, output)
+            self.assertTrue((output / "rlm_trace.jsonl").exists())
+            self.assertTrue((output / "rlm_trace.replay.jsonl").exists())
+
+    def test_budget_unpriced_warning(self) -> None:
+        keys = ("OPENAI_INPUT_USD_PER_MTOK", "OPENAI_OUTPUT_USD_PER_MTOK")
+        previous = {key: os.environ.get(key) for key in keys}
+        try:
+            for key in keys:
+                os.environ.pop(key, None)
+            self.assertIsNone(budget_unpriced_warning(None))
+            self.assertIsNotNone(budget_unpriced_warning(1.0))
+            os.environ["OPENAI_INPUT_USD_PER_MTOK"] = "0.15"
+            os.environ["OPENAI_OUTPUT_USD_PER_MTOK"] = "0.60"
+            self.assertIsNone(budget_unpriced_warning(1.0))
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def test_cli_loads_openai_env_file_without_printing_secret_defaults(self) -> None:
         keys = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL")
@@ -345,6 +409,51 @@ class FakeJSONClient:
                 output_tokens=self.usage["output_tokens"],
             )
         return self.payload
+
+
+class FailingFieldExtractor:
+    name = "failing"
+
+    def extract_call_fields(self, call, chunks, specs):
+        del call, chunks, specs
+        raise ExtractionError("fixture extraction failure")
+
+
+def sample_call_records() -> list[CallRecord]:
+    return [
+        CallRecord(
+            call_id="call-001",
+            customer_id="cust-001",
+            account_name="Acme",
+            date="2026-01-01",
+            transcript="turn:1 speaker:customer: We need SSO and audit logs for security review.",
+            turns=[
+                TranscriptTurn(
+                    call_id="call-001",
+                    turn_index=1,
+                    speaker="customer",
+                    text="We need SSO and audit logs for security review.",
+                )
+            ],
+            metadata={},
+        ),
+        CallRecord(
+            call_id="call-002",
+            customer_id="cust-002",
+            account_name="Beta",
+            date="2026-01-02",
+            transcript="turn:1 speaker:customer: Pricing is blocking renewal.",
+            turns=[
+                TranscriptTurn(
+                    call_id="call-002",
+                    turn_index=1,
+                    speaker="customer",
+                    text="Pricing is blocking renewal.",
+                )
+            ],
+            metadata={},
+        ),
+    ]
 
 
 if __name__ == "__main__":

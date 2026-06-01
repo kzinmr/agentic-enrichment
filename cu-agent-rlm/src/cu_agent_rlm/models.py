@@ -80,6 +80,11 @@ class TraceEvent:
     tool: str
     arguments: dict[str, Any]
     result_summary: str
+    latency_ms: float | None = None
+    tokens: dict[str, Any] = field(default_factory=dict)
+    fallback_reason: str | None = None
+    prompt_hash: str | None = None
+    validation_result: str | None = None
 
 
 @dataclass

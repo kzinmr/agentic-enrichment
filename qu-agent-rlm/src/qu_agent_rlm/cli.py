@@ -17,10 +17,13 @@ from .llm import (
     OpenAICompatibleChatClient,
     OpenAIResponsesClient,
 )
+import sys
+
 from .planner import HeuristicQueryPlanner, LLMQueryPlanner, QueryPlanner
 from .prompt_repair import append_prompt_repair_requests
 from .retrieval import DEFAULT_EMBEDDING_MODEL, OpenAIEmbeddingClient
 from .retrieval_agent import AgenticRetrievalSubAgent, RetrievalSubAgent, SearchExecutionPolicy
+from .usage import budget_unpriced_warning
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -97,6 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-search-calls", type=int, default=1)
     parser.add_argument("--max-search-iterations", type=int, default=0)
     parser.add_argument("--query-diversity-threshold", type=float, default=0.8)
+    parser.add_argument("--max-errors", type=int, default=3)
+    parser.add_argument("--max-budget-usd", type=float, default=None)
+    parser.add_argument("--max-timeout-seconds", type=float, default=None)
     parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--embedding-cache", type=Path, default=None)
     return parser
@@ -118,6 +124,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    budget_warning = budget_unpriced_warning(args.max_budget_usd)
+    if budget_warning:
+        print(f"WARNING: {budget_warning}", file=sys.stderr)
     embedding_client = build_embedding_client(args)
     embedding_cache = args.embedding_cache
     if embedding_cache is None and embedding_client is not None:
@@ -137,6 +146,9 @@ def main() -> int:
         retrieval_mode=args.retrieval_mode,
         retrieval_subagent=retrieval_subagent,
         answer_judge=answer_judge,
+        max_errors=args.max_errors,
+        max_budget_usd=args.max_budget_usd,
+        max_timeout_seconds=args.max_timeout_seconds,
     )
     if args.eval_tasks:
         report = run_eval(agent, args.eval_tasks)
