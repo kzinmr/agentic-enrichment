@@ -171,6 +171,43 @@
 
 ---
 
+## 横断 — Document Schema のポータビリティ（外部ジョブでの抽出実行）
+
+### T10. ポータブルな Document Schema export contract ＋ standalone extraction runtime（EXPORT-001）
+
+- **優先度**: 要件駆動（CU-QU loop が生成した Document Schema を artifact として書き出し、**外部の Python ジョブが読み込んで Schema 準拠の LLM 抽出を自己完結実行**する要件）。RLM ラダー（P0–P3）とは直交する packaging/portability の課題。
+- **現状（コード監査）**: `io.write_artifact`（`io.py:117-160`）は **宣言（FieldSpec）を完全・round-trip 可能な形で出力**している（`field_specs.jsonl`＝dataclass 直列化、`silver_schema_catalog.json`＝promoted の詳細）し、証跡母集合も `chunks.jsonl` に出る。**しかし抽出を再現するための固定メカニズムが artifact に出ていない**:
+  - 抽出**プロンプト本文**は未出力。`manifest.prompt_state` は `{prompt_id, prompt_version, prompt_role, prompt_hash}` の**メタのみ**（`pipeline.py:prompt_state`）。
+  - **validator** は `cu_agent_rlm.extraction` の**コード**（`validate_extraction_payload` / `coerce_value` / `evidence_refs⊂chunk_ids` / abstain・正規化）であり、データとして書き出されない。
+  - 出力エンベロープ（`{"fields":[{name,value,confidence,evidence_refs,abstained,rationale}]}`）の**機械可読スキーマ**が無い（プロンプト本文に暗黙）。
+  - 帰結：今日のポータビリティは「artifact JSON だけ」では成立せず、外部ジョブが `cu_agent_rlm` 本体（＋一致する prompt version）に**依存**する "パッケージ結合" 型に留まる。
+- **狙い**: 「**artifact（データ）＋ 依存の薄い純ランタイム**」で外部 Python ジョブが抽出を自己完結実行できるようにし、**FieldSpec を端から端まで唯一の変動源**にする。汎用インタプリタ設計（凍結プロンプト1枚＋型ディスパッチ validator）を維持したまま、固定メカニズムを「1回エクスポート＋field_specs の純関数化」で外部化する（per-field にプロンプト/スキーマを materialize する N×設計は採らない）。
+- **手順**:
+  1. `extraction_contract.json` を出力：`prompt_id@version` ＋ **prompt 本文** ＋ `prompt_hash` ＋ 出力エンベロープ契約 ＋ `evidence_ref` prefix（`chunk:`）＋ chunking パラメータ（`max_chunk_chars` 等）。`prompt_hash` を版ずれ検出の再現性アンカーにする。
+  2. `derive_response_schema(field_specs)` を**純関数**として実装（type→JSON Schema、enum/list は `allowed_values` を `enum` 制約へ）。前出の dynamic structured output と共有部品。
+  3. **`cu_agent_rlm` 非依存の `portable_extractor`** を切り出す：`build_user_payload(field_specs, chunks)` / `derive_response_schema(field_specs)` / `validate(payload, field_specs, chunk_ids)` の純関数3点。入力は `field_specs.jsonl` ＋ `chunks.jsonl` のみ。本体 `LLMFieldExtractor` と**同等性テスト**で結線。
+  4. **忠実再現ガード**：外部ジョブは `chunks.jsonl` を再 chunk せず消費する（`evidence_refs⊂chunk_ids` と chunk 境界の同一性）。validator の正規化が silver 値の意味論を定義するため runtime に内包する。
+  5. **(任意併走) induction 側に strict structured output を能力検出付きで導入**（出力 shape が静的＝固める価値あり。`OpenAICompatibleChatClient` 経路は `json_object` フォールバックを維持、validator は条件付き制約・正規化の残差として保持）。
+- **受け入れ条件**: 外部 Python ジョブが **artifact のみ（＋薄い純ランタイム）** で LLM 抽出を実行でき、同一入力で本体 pipeline の `field_extractions.jsonl` / `silver_calls.jsonl` と**一致**する。`cu_agent_rlm` 本体の import 無しで動く。`prompt_hash` 照合で生成時とのプロンプト版ずれを検出できる。型システム拡張（T7）時は `extraction_contract` も同期して更新される。
+- **RLM 参照**: minimal の schema-as-data / model-driven topology、フル版 §6（子の能力契約を**型で開示**）。子（抽出器）の能力を「データ契約」として外部プロセスへ開示する発想の応用。
+- **依存**: なし（既存の `field_specs.jsonl` / `chunks.jsonl` export に乗る、独立着手可）。T7（表現力拡張）と型契約を同期。手順5は前出の構造化出力議論と `derive_response_schema` を共有。
+
+### T11. schema_induction の strict structured output 化（SO-001）
+
+- **優先度**: 信頼性・再現性の改善（任意併走、T10 手順5 を独立化）。RLM ラダーとは直交。
+- **現状（コード監査）**: `LLMSchemaInducer.induce_schema`（`schema.py:117-130`）は `self.llm.complete_json` ＝ **`json_object` モード**で出力し、API の strict structured output（`response_format: json_schema`）は未使用。shape と閉じた型集合 `{list,enum,boolean,string}` は **手書きの `validate_schema_payload`（`schema.py:179-225`、型チェックは `:197`）が enforce** し、同関数が name 正規化・dedupe・RESERVED 除外・`allowed_values` 上限・`enum` への `not_mentioned` 注入・flags 派生・`max_fields` 打ち切り・0件 raise といった**正規化/変異**も担う。両クライアントとも JSON モードのみ（`OpenAIResponsesClient`＝`text.format.type=json_object`／`OpenAICompatibleChatClient`＝`response_format.type=json_object`）。
+- **狙い**: induction の**出力 shape は著者時点で静的に既知**（`{"fields":[{name,type∈4種,description,allowed_values,downstream_use_cases,flags}]}`）なので、**API 境界で凍結 JSON Schema により固める価値がある**。`type` enum と shape を制約デコーディングで保証することで、(a) 形不一致でのサイレント drop（`schema.py` の `continue`）と reask/repair トークンを削減、(b) 再現性向上。validator は**消さず、「条件付き制約・正規化・変異」の残差**に縮小する。
+- **手順**:
+  1. `cu.schema_induction` の**出力契約として凍結 JSON Schema** を定義（`fields` array／item object：`name:str`・`type:enum[list,enum,boolean,string]`・`description:str`・`allowed_values:[str]`・`downstream_use_cases:[str]`・`filterable/facetable/aggregatable:bool`、`additionalProperties:false`、`required`）。プロンプトと同列の**version＋hash 管理の凍結成果物**にする。
+  2. `JSONChatClient` に**能力検出付きの strict 出力経路**を追加（`OpenAIResponsesClient` は `response_format=json_schema` を使用、`OpenAICompatibleChatClient` は能力フラグで **`json_object` フォールバック**を維持）。
+  3. **validator 残差化**：shape/型タグの検証は schema 強制へ委譲し、`validate_schema_payload` は「`list`/`enum`→`allowed_values` 非空」「`enum` への `not_mentioned` 注入」「name 正規化・dedupe・RESERVED 除外」「`allowed_values` 上限・`description` 既定・flags 派生・`max_fields`・0件 raise」など**条件付き制約・正規化・変異のみ**を残す（strict では if/then 等の条件制約・変異は表現不可のため）。
+  4. **同等性テスト**：strict 経路と `json_object` 経路で、同一入力に対し同じ `FieldSpec` 集合（fallback 含む）を生成することを検証。
+- **受け入れ条件**: 能力のあるバックエンドで `type` enum / shape 違反が**原理的に発生しない**（サイレント drop 経路が消える）。compatible 経路は従来どおり `json_object`＋validator で動作。出力契約スキーマが version＋hash で凍結・追跡される。重複していた shape/型検証が validator から除去され、残差のみになる。
+- **RLM 参照**: フル版 §6（能力別ツールの**型契約を開示**）— 子（schema inducer）の出力を型で固定する発想。
+- **依存**: 能力検出・凍結スキーマ管理の仕組みを **T10（EXPORT-001）と共通化**できる（induction 出力スキーマと extraction の `derive_response_schema` は別物だが、クライアント能力検出と「凍結スキーマ＋hash」運用は共有）。プロンプト governance（`frozen=True`＋version）と同期。
+
+---
+
 ## 依存グラフ（着手順）
 
 ```
@@ -185,6 +222,8 @@ T2,T3 ──▶ T6 (observe-then-replan loop)     [P2] ★最重要
 T6 ──▶ T7 (bounded CodeAct in aggregate)    [P3]
 T5,T6 ──▶ T8 (typed sub-agent I/F, DE-003)  [P3]
 T6,T8 ──▶ T9 (CU-QU negotiation, DE-002)    [P3]
+T10 (portable Document Schema export + runtime, EXPORT-001)  [横断/独立] ── 既存 export に依存、T7 と型契約を同期
+T11 (schema_induction strict structured output, SO-001)  [横断/独立] ── T10 と能力検出・凍結スキーマ運用を共有
 ```
 
 **推奨スプリント**: ① T1→T2→T3（基盤）→ ② T4・T5（並列化、独立着手可）→ ③ T6（昇格の核）→ ④ T7/T8/T9（表現力・構造化）。
