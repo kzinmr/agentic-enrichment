@@ -30,6 +30,7 @@ from qu_agent_rlm.query_tasks import (
 )
 from qu_agent_rlm.replay import REDACTED, redact_for_replay
 from qu_agent_rlm.retrieval import BM25Index
+from qu_agent_rlm.schema_negotiation import evaluate_field_candidates
 from qu_agent_rlm.usage import UsageSummary, budget_unpriced_warning
 
 
@@ -110,6 +111,89 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             self.assertTrue(result["aggregation"])
             self.assertEqual(result["prompt_state"]["planner"]["prompt_id"], "qu.query_planner")
             self.assertIn("prompt_hash", result["prompt_state"]["planner"])
+
+    def test_aggregate_silver_accepts_bounded_expression(self) -> None:
+        corpus = SilverCorpus(
+            manifest={"schema_version": "test"},
+            catalog={
+                "schema_version": "test",
+                "fields": [
+                    {
+                        "name": "product_area",
+                        "type": "enum",
+                        "allowed_values": ["crm", "analytics"],
+                        "search": {"filterable": True, "aggregatable": True},
+                    },
+                    {
+                        "name": "security_review_requested",
+                        "type": "boolean",
+                        "allowed_values": [],
+                        "search": {"filterable": True, "aggregatable": True},
+                    },
+                    {
+                        "name": "deal_size",
+                        "type": "string",
+                        "allowed_values": [],
+                        "search": {"filterable": True, "aggregatable": True},
+                    },
+                ],
+            },
+            records=[
+                {
+                    "call_id": "call-001",
+                    "account_name": "Acme",
+                    "date": "2026-01-01",
+                    "fields": {"product_area": "crm", "security_review_requested": True, "deal_size": 2500},
+                    "evidence_refs": {"product_area": ["chunk:call-001:chunk-001"]},
+                    "quality_flags": [],
+                },
+                {
+                    "call_id": "call-002",
+                    "account_name": "Beta",
+                    "date": "2026-01-02",
+                    "fields": {"product_area": "crm", "security_review_requested": False, "deal_size": 800},
+                    "evidence_refs": {"product_area": ["chunk:call-002:chunk-001"]},
+                    "quality_flags": [],
+                },
+                {
+                    "call_id": "call-003",
+                    "account_name": "Core",
+                    "date": "2026-02-01",
+                    "fields": {"product_area": "analytics", "security_review_requested": True, "deal_size": 9000},
+                    "evidence_refs": {"product_area": ["chunk:call-003:chunk-001"]},
+                    "quality_flags": [],
+                },
+            ],
+            chunks=[],
+        )
+        agent = QueryUnderstandingAgent(
+            corpus,
+            planner=AggregationExpressionPlanner(
+                'ratio(count_if(records, "security_review_requested", True), count(records))'
+            ),
+        )
+
+        result = agent.answer("What ratio of calls ask for security review?", limit=5)
+
+        self.assertEqual(result["aggregation"]["numerator"], 2)
+        self.assertEqual(result["aggregation"]["denominator"], 3)
+        self.assertEqual(result["aggregation"]["ratio"], 0.6667)
+        aggregate_events = [event for event in result["trace"] if event["tool"] == "aggregate_silver"]
+        self.assertEqual(
+            aggregate_events[0]["arguments"]["expression"],
+            'ratio(count_if(records, "security_review_requested", True), count(records))',
+        )
+
+        top_k = corpus.aggregate_silver_result("", {}, expression='top_k(records, "product_area", k=1)')
+        self.assertEqual(top_k.result, {"crm": 2})
+        numeric = corpus.aggregate_silver_result(
+            "",
+            {},
+            expression='numeric_range_count(records, "deal_size", min_value=1000, max_value=5000)',
+        )
+        self.assertEqual(numeric.result["count"], 1)
+        with self.assertRaises(ValueError):
+            corpus.aggregate_silver_result("", {}, expression='__import__("os").system("whoami")')
 
     def test_usage_summary_accumulates_query_llm_calls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -326,11 +410,46 @@ class QueryUnderstandingRLMTest(unittest.TestCase):
             fanout_events = [event for event in result["trace"] if event["arguments"].get("fanout")]
             self.assertTrue(fanout_events)
             self.assertEqual(fanout_events[0]["arguments"]["fanout"], 2)
+            self.assertIn("subagent_join", [event["tool"] for event in result["trace"]])
+            branch_calls = result["subagent_diagnostics"]["calls"]
+            self.assertEqual(len(branch_calls), 2)
+            self.assertEqual(branch_calls[0]["validation_result"], "ok")
+            self.assertEqual(branch_calls[0]["call"]["capability"], "retrieval_branch")
+            self.assertTrue(branch_calls[0]["call"]["input_refs"])
+            self.assertIn("output_schema", branch_calls[0]["call"])
+            self.assertIn("max_results", branch_calls[0]["call"]["budget"])
             record_ids = [record["call_id"] for record in result["records"]]
             self.assertEqual(len(record_ids), len(set(record_ids)))  # merged + deduped
             self.assertIn("call-001", record_ids)
             self.assertIn("call-005", record_ids)
             self.assertGreaterEqual(agent.max_active, 2)  # subqueries ran concurrently
+
+    def test_qu_evaluates_cu_field_candidates(self) -> None:
+        sample = workspace / "data" / "sample_calls.jsonl"
+        source_sql = next((p for p in [workspace / "call_records.sql"] if p.exists()), None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "corpus"
+            run_content_understanding(sample, output, source_sql=source_sql, schema_inducer=StaticSchemaInducer())
+            corpus = SilverCorpus.from_dir(output)
+
+            report = evaluate_field_candidates(
+                corpus,
+                query_tasks=[
+                    {
+                        "task_id": "security",
+                        "query": "Which calls mention security review?",
+                        "expected_operation": "filter",
+                    }
+                ],
+            )
+
+            self.assertEqual(report["contract"], "qu.field_candidate_evaluation@2026-06-02.1")
+            self.assertTrue(report["evaluations"])
+            security = next(item for item in report["evaluations"] if item["field_name"] == "security_review_requested")
+            self.assertIn(security["decision"], report["decision_values"])
+            self.assertEqual(security["validation_result"], "ok")
+            self.assertIn("filter", security["simulation"])
 
     def test_agent_accepts_specialized_retrieval_subagent(self) -> None:
         sample = workspace / "data" / "sample_calls.jsonl"
@@ -713,6 +832,36 @@ class FanoutSearchPlanner:
                     purpose="Parallel subquery fan-out.",
                 ),
                 QueryToolStep(tool="fetch_chunks", arguments={"limit": 5}, purpose="Fetch evidence."),
+            ],
+        )
+
+
+class AggregationExpressionPlanner:
+    name = "aggregate-expression-static"
+
+    def __init__(self, expression):
+        self.expression = expression
+
+    def plan(self, query, catalog):
+        del catalog
+        return QueryPlan(
+            operation="aggregate",
+            aggregation_expression=self.expression,
+            retrieve_evidence=False,
+            ranking_query=query,
+            planner=self.name,
+            reasoning="Fixture aggregate expression plan.",
+            steps=[
+                QueryToolStep(
+                    tool="query_silver",
+                    arguments={"filters": {}, "limit": 50},
+                    purpose="Load records for expression aggregation.",
+                ),
+                QueryToolStep(
+                    tool="aggregate_silver",
+                    arguments={"expression": self.expression, "filters": {}},
+                    purpose="Run bounded aggregate expression.",
+                ),
             ],
         )
 

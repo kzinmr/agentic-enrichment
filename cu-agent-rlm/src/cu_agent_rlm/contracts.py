@@ -58,6 +58,24 @@ def build_extraction_contract(field_specs: list[Any], *, max_chunk_chars: int) -
             "chunk_id_format": "{call_id}:chunk-{index:03d}",
             "external_runtime_policy": "consume chunks.jsonl as exported; do not re-chunk transcripts",
         },
+        "aggregation": {
+            "contract_id": "qu.aggregate_silver.expression",
+            "version": "2026-06-02.1",
+            "scope": "allowlisted expressions over exported silver_calls fields only",
+            "allowed_functions": [
+                "count",
+                "group_count",
+                "top_k",
+                "nested_group_count",
+                "count_if",
+                "count_where",
+                "numeric_range_count",
+                "date_range_count",
+                "cohort_count",
+                "ratio",
+            ],
+            "field_policy": "expression field references must exist in silver_schema_catalog.json and be marked search.aggregatable=true",
+        },
     }
     return {**contract, "contract_hash": contract_hash(contract)}
 

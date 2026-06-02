@@ -115,6 +115,7 @@
 ## P2 — ループ駆動（LLM をパラメータ係から orchestrator へ昇格）
 
 > **実装状況（2026-06-01）: T6 ✅ 完了**。QU `answer()` を bounded `plan → execute → judge/observe → replan` ループへ再構成。初回 plan は従来どおり温存し、`replan` 対応 planner（現状 `LLMQueryPlanner`）だけが judge 観測後に次 iteration へ進むため、heuristic/static planner の single-plan 動作は維持。観測には records/chunks/search failures/judge failure modes/既存 `column_requests` を圧縮して渡し、trace に `plan_observation` / `replan_query:*` / `plan_iteration` を記録。CLI/scripts に `--max-plan-iterations`（既定2、1で従来相当）を追加。replanner prompt では「既存フィールドへ無理に押し込まず、より適した CU フィールド設計がある場合は constructive `column_requests` として提案する」方針を明示し、暫定回答と schema feedback の両立を保つ。
+> **実装状況（2026-06-02）: T7 ✅ 完了**。`aggregate_silver` に silver records 限定の allowlisted expression evaluator を追加。許可関数は `count` / `group_count` / `top_k` / `nested_group_count` / `count_if` / `count_where` / `numeric_range_count` / `date_range_count` / `cohort_count` / `ratio` に限定し、AST validator が `open/__import__/eval/exec`・attribute/subscript/comprehension・未許可 builtin を拒否。planner は `aggregation_expression` を top-level と step arguments の両方で受け取り、参照フィールドを catalog の `search.aggregatable=true` に制約。結果は既存 `aggregation` へ正規化し、集計に使った field の `evidence_refs` を `fetch_chunks` に流す。プロンプトと extraction contract に式集計 contract を反映。
 
 ### T6. 観測駆動の外側ループ：plan 凍結を解く（最重要・設計変更大）
 
@@ -144,6 +145,10 @@
 ---
 
 ## P3 — 構造化サブエージェント（DE-003 / DE-002、将来）
+
+> **実装状況（2026-06-02）: T8 ✅ / T9 ✅ 完了**。
+> - **T8**: typed sub-agent call contract を QU/CU に追加。QU の検索 fan-out は各 branch を `input_refs` / `output_schema` / `budget` / `validator` 付き `retrieval_branch` sub-call として検証・trace し、fan-out 後に `subagent_join` で出力 refs を集約。回答 payload に `subagent_diagnostics` を追加。CU 側は `field_candidate_proposal` を typed sub-call として trace し、candidate schema を検証。
+> - **T9**: CU が `field_candidates.json` と `schema_negotiation.json` を出力。候補には intended queries / example filters / example aggregations / evidence requirements / uncertainty / rationale を含め、CU 側 decision は `promote/defer/retrieval_only/merge_with_existing/needs_human_review` に正規化。QU 側に `evaluate_field_candidates` を追加し、候補を filter/aggregate/search simulation と observed query tasks で評価。`qu_cu_loop_demo.py` は baseline CU 後に `field_candidate_evaluation.json` を出力し、orchestration trace / summary に判定を残す。
 
 ### T8. 型付きサブエージェント呼び出し I/F（DE-003）
 

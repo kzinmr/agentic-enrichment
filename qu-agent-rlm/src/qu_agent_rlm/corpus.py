@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 import json
 import re
 from pathlib import Path
 from typing import Any
 
+from .aggregation import AggregationEvaluation, evaluate_aggregation_expression, grouped_count
 from .retrieval import BM25Index, EmbeddingClient, EmbeddingIndex, build_search_documents
 
 
@@ -51,6 +51,8 @@ class SilverCorpus:
         catalog: dict[str, Any],
         records: list[dict[str, Any]],
         chunks: list[dict[str, Any]],
+        field_candidates: list[dict[str, Any]] | None = None,
+        schema_negotiation: dict[str, Any] | None = None,
         embedding_client: EmbeddingClient | None = None,
         embedding_cache_path: Path | None = None,
     ) -> None:
@@ -58,6 +60,8 @@ class SilverCorpus:
         self.catalog = catalog
         self.records = records
         self.chunks = chunks
+        self.field_candidates = field_candidates or []
+        self.schema_negotiation = schema_negotiation or {}
         self.fields = {field["name"]: field for field in catalog.get("fields", [])}
         self.records_by_id = {record["call_id"]: record for record in records}
         self.chunks_by_id = {chunk["chunk_id"]: chunk for chunk in chunks}
@@ -80,6 +84,8 @@ class SilverCorpus:
             catalog=read_json(path / "silver_schema_catalog.json"),
             records=read_jsonl(path / "silver_calls.jsonl"),
             chunks=read_jsonl(path / "chunks.jsonl"),
+            field_candidates=read_json_optional(path / "field_candidates.json", default=[]),
+            schema_negotiation=read_json_optional(path / "schema_negotiation.json", default={}),
             embedding_client=embedding_client,
             embedding_cache_path=embedding_cache_path,
         )
@@ -88,16 +94,20 @@ class SilverCorpus:
         matched = [record for record in self.records if record_matches(record, filters)]
         return matched if limit is None else matched[:limit]
 
-    def aggregate_silver(self, group_by: str, filters: dict[str, Any]) -> dict[str, int]:
+    def aggregate_silver(self, group_by: str, filters: dict[str, Any], *, expression: str | None = None) -> dict[str, Any]:
+        return self.aggregate_silver_result(group_by, filters, expression=expression).result
+
+    def aggregate_silver_result(
+        self,
+        group_by: str,
+        filters: dict[str, Any],
+        *,
+        expression: str | None = None,
+    ) -> AggregationEvaluation:
         records = self.query_silver(filters)
-        counter: Counter[str] = Counter()
-        for record in records:
-            value = record.get("fields", {}).get(group_by)
-            if isinstance(value, list):
-                counter.update(str(item) for item in value)
-            elif value not in (None, "", False, "not_mentioned"):
-                counter[str(value)] += 1
-        return dict(sorted(counter.items(), key=lambda item: (-item[1], item[0])))
+        if expression:
+            return evaluate_aggregation_expression(expression, records, self.fields)
+        return AggregationEvaluation(result=grouped_count(records, group_by), used_fields=[group_by] if group_by else [])
 
     def search_chunks(
         self,
@@ -239,6 +249,12 @@ def normalize_chunk_ref(ref: str) -> str:
 
 
 def read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_json_optional(path: Path, *, default: Any) -> Any:
+    if not path.exists():
+        return default
     return json.loads(path.read_text(encoding="utf-8"))
 
 

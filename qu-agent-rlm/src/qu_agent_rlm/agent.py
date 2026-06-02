@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
+import json
 import time
 from typing import Any
 
+from .aggregation import collect_aggregation_evidence_refs
 from .corpus import SilverCorpus, ToolEvent
 from .judge import AnswerJudge, HeuristicAnswerJudge
 from .llm import JSONChatClient
@@ -18,6 +20,7 @@ from .planner import (
 )
 from .retrieval import english_tokenize
 from .retrieval_agent import AgenticRetrievalSubAgent, RetrievalSubAgent, SearchExecutionPolicy
+from .subagents import complete_retrieval_branch_call, join_subagent_results, retrieval_branch_call
 from .usage import usage_delta, usage_summary_from_components
 
 
@@ -83,7 +86,7 @@ class QueryUnderstandingAgent:
         plan: QueryPlan | None = None
         answer = ""
         records: list[dict[str, Any]] = []
-        aggregation: dict[str, int] = {}
+        aggregation: dict[str, Any] = {}
         evidence: list[dict[str, Any]] = []
         column_requests: list[ColumnRequest] = []
         judgement: dict[str, Any] = {}
@@ -185,6 +188,8 @@ class QueryUnderstandingAgent:
             search_calls=state["search_calls"],
             search_failures=state["search_failures"],
             rerank=state["rerank"],
+            subagent_calls=state["subagent_calls"],
+            subagent_joins=state["subagent_joins"],
             judgement=judgement,
             retrieval_subagent=self.retrieval_subagent.name,
             prompt_state=self.prompt_state(judgement, state),
@@ -227,7 +232,8 @@ class QueryUnderstandingAgent:
                 },
                 result_summary=(
                     f"operation={plan.operation} filters={plan.filters} "
-                    f"group_by={plan.group_by} steps={len(plan.steps)} reasoning={plan.reasoning}"
+                    f"group_by={plan.group_by} aggregation_expression={plan.aggregation_expression} "
+                    f"steps={len(plan.steps)} reasoning={plan.reasoning}"
                 ),
                 latency_ms=elapsed_ms(started),
                 tokens=plan_tokens,
@@ -382,7 +388,7 @@ class QueryUnderstandingAgent:
         trace: list[ToolEvent],
         guardrails: "GuardrailState",
         iteration: int,
-    ) -> tuple[str, list[dict[str, Any]], dict[str, int], list[dict[str, Any]], list[ColumnRequest], dict[str, Any]]:
+    ) -> tuple[str, list[dict[str, Any]], dict[str, Any], list[dict[str, Any]], list[ColumnRequest], dict[str, Any]]:
         records = state["records"][:limit]
         aggregation = state["aggregation"]
         evidence = state["evidence"]
@@ -461,10 +467,38 @@ class QueryUnderstandingAgent:
             promote = plan.operation == "search" or bool(arguments.get("promote_records"))
             trace_tool = self.trace_tool_name(step.tool)
             fanout = len(subqueries)
+            parent_id = f"query-step-{len(state['subagent_calls']) + 1}"
+            input_refs = retrieval_input_refs(self.corpus, filters)
+            branch_calls = [
+                retrieval_branch_call(
+                    parent_id=parent_id,
+                    agent=trace_tool,
+                    tool=trace_tool,
+                    query=sub_query,
+                    filters=filters,
+                    input_refs=input_refs,
+                    max_results=step_limit,
+                    max_budget_usd=self.max_budget_usd,
+                )
+                for sub_query in subqueries
+            ]
             # map: run each subquery's retrieval (in parallel when the plan fans out),
             # then reduce by merging chunks/records with the existing dedupe helpers.
             results = self.run_subquery_searches(step.tool, subqueries, filters=filters, limit=step_limit)
-            for sub_query, chunks in zip(subqueries, results):
+            output_refs: list[str] = []
+            completed_call_ids: list[str] = []
+            for branch_call, sub_query, chunks in zip(branch_calls, subqueries, results):
+                completed = complete_retrieval_branch_call(
+                    branch_call,
+                    chunks,
+                    known_chunk_ids=set(self.corpus.chunks_by_id),
+                )
+                completed_payload = completed.to_dict()
+                if completed.validation_result != "ok":
+                    raise ValueError(completed.error or "retrieval branch output failed validation")
+                state["subagent_calls"].append(completed_payload)
+                completed_call_ids.append(branch_call.call_id)
+                output_refs.extend(completed.output_refs)
                 state["chunks"] = merge_chunks(state["chunks"], chunks)
                 if promote:
                     state["records"] = merge_records(state["records"], records_for_chunks(self.corpus, chunks))
@@ -487,6 +521,10 @@ class QueryUnderstandingAgent:
                     "limit": step_limit,
                     "purpose": step.purpose,
                     "query_terms": search_call["query_terms"],
+                    "subagent_call_id": branch_call.call_id,
+                    "output_schema": branch_call.output_schema,
+                    "budget": branch_call.budget,
+                    "validator": branch_call.validator,
                 }
                 if fanout > 1:
                     event_arguments["fanout"] = fanout
@@ -496,6 +534,22 @@ class QueryUnderstandingAgent:
                         tool=trace_tool,
                         arguments=event_arguments,
                         result_summary=search_call["summary"],
+                    )
+                )
+            if fanout > 1:
+                join = join_subagent_results(
+                    parent_id=parent_id,
+                    input_call_ids=completed_call_ids,
+                    output_refs=dedupe(output_refs),
+                )
+                state["subagent_joins"].append(join)
+                trace.append(
+                    ToolEvent(
+                        step=len(trace) + 1,
+                        tool="subagent_join",
+                        arguments=join,
+                        result_summary=f"Joined {len(completed_call_ids)} retrieval branches into {len(join['output_refs'])} chunk refs.",
+                        validation_result=join["validation_result"],
                     )
                 )
             return
@@ -518,14 +572,26 @@ class QueryUnderstandingAgent:
         if step.tool == "aggregate_silver":
             filters = filters_from_arguments(arguments, default=plan.filters)
             group_by = str(arguments.get("group_by") or plan.group_by or "")
-            aggregation = self.corpus.aggregate_silver(group_by, filters) if group_by else {}
-            state["aggregation"] = aggregation
+            expression = aggregation_expression_from_arguments(arguments, plan=plan)
+            evaluation = self.corpus.aggregate_silver_result(group_by, filters, expression=expression)
+            state["aggregation"] = evaluation.result
+            aggregate_records = state["records"] or self.corpus.query_silver(filters)
+            state["aggregation_refs"] = collect_aggregation_evidence_refs(
+                aggregate_records,
+                evaluation.used_fields,
+            )
             trace.append(
                 ToolEvent(
                     step=len(trace) + 1,
                     tool="aggregate_silver",
-                    arguments={"group_by": group_by, "filters": filters, "purpose": step.purpose},
-                    result_summary=f"{len(aggregation)} groups",
+                    arguments={
+                        "group_by": group_by,
+                        "expression": expression,
+                        "filters": filters,
+                        "used_fields": evaluation.used_fields,
+                        "purpose": step.purpose,
+                    },
+                    result_summary=f"{aggregation_group_count(evaluation.result)} groups",
                 )
             )
             return
@@ -535,6 +601,8 @@ class QueryUnderstandingAgent:
             step_limit = bounded_limit(arguments.get("limit"), default=8)
             if not refs:
                 refs = collect_evidence_refs(state["records"][:limit], plan)
+            if not refs and state.get("aggregation_refs"):
+                refs = list(state["aggregation_refs"])
             if not refs and state["chunks"]:
                 refs = [f"chunk:{chunk['chunk_id']}" for chunk in state["chunks"][:step_limit]]
             refs = dedupe(refs)[:step_limit]
@@ -664,7 +732,7 @@ def result_payload(
     plan: QueryPlan,
     answer: str,
     records: list[dict[str, Any]],
-    aggregation: dict[str, int],
+    aggregation: dict[str, Any],
     evidence: list[dict[str, Any]],
     trace: list[ToolEvent],
     column_requests: list[ColumnRequest],
@@ -672,6 +740,8 @@ def result_payload(
     search_calls: list[dict[str, Any]],
     search_failures: list[dict[str, Any]],
     rerank: dict[str, Any],
+    subagent_calls: list[dict[str, Any]],
+    subagent_joins: list[dict[str, Any]],
     judgement: dict[str, Any],
     retrieval_subagent: str,
     prompt_state: dict[str, Any],
@@ -690,6 +760,7 @@ def result_payload(
         "evidence": evidence,
         "column_requests": [asdict(request) for request in column_requests],
         "search_diagnostics": {"subagent": retrieval_subagent, "calls": search_calls, "failures": search_failures},
+        "subagent_diagnostics": {"calls": subagent_calls, "joins": subagent_joins},
         "rerank": rerank,
         "judgement": judgement,
         "prompt_state": prompt_state,
@@ -705,6 +776,7 @@ def initial_query_state() -> dict[str, Any]:
         "records": [],
         "chunks": [],
         "aggregation": {},
+        "aggregation_refs": [],
         "evidence": [],
         "column_requests": [],
         "search_calls": [],
@@ -712,6 +784,8 @@ def initial_query_state() -> dict[str, Any]:
         "rerank": {},
         "retrieval_prompt": {},
         "reranker_prompt": {},
+        "subagent_calls": [],
+        "subagent_joins": [],
     }
 
 
@@ -724,7 +798,7 @@ def build_plan_observation(
     plan: QueryPlan,
     answer: str,
     records: list[dict[str, Any]],
-    aggregation: dict[str, int],
+    aggregation: dict[str, Any],
     evidence: list[dict[str, Any]],
     state: dict[str, Any],
     column_requests: list[ColumnRequest],
@@ -740,6 +814,7 @@ def build_plan_observation(
         "evidence": compact_evidence_for_observation(evidence),
         "search_calls": summarize_search_calls_for_llm(state["search_calls"]),
         "search_failures": state["search_failures"][-6:],
+        "subagent_calls": state.get("subagent_calls", [])[-6:],
         "candidate_chunks": chunks_for_llm(state["chunks"][:12]),
         "column_requests": [asdict(request) for request in column_requests],
         "state_counts": {
@@ -901,7 +976,7 @@ def judgement_with_guardrail(judgement: dict[str, Any], reason: str) -> dict[str
 
 def best_partial_answer(
     records: list[dict[str, Any]],
-    aggregation: dict[str, int],
+    aggregation: dict[str, Any],
     evidence: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
@@ -939,9 +1014,11 @@ def compact_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def aggregate_answer(plan: QueryPlan, aggregation: dict[str, int]) -> str:
+def aggregate_answer(plan: QueryPlan, aggregation: dict[str, Any]) -> str:
     if not aggregation:
         return "No matching records were found for the requested aggregation."
+    if plan.aggregation_expression:
+        return f"Aggregation expression returned: {json.dumps(aggregation, ensure_ascii=False, sort_keys=True)}."
     pairs = ", ".join(f"{key}: {value}" for key, value in aggregation.items())
     return f"Grouped by {plan.group_by}: {pairs}."
 
@@ -968,6 +1045,27 @@ def filters_from_arguments(arguments: dict[str, Any], *, default: dict[str, Any]
         return default
     filters = arguments.get("filters")
     return filters if isinstance(filters, dict) else {}
+
+
+def aggregation_expression_from_arguments(arguments: dict[str, Any], *, plan: QueryPlan) -> str | None:
+    expression = arguments.get("expression", plan.aggregation_expression)
+    if expression in (None, "", "null"):
+        return None
+    return str(expression)
+
+
+def aggregation_group_count(aggregation: dict[str, Any]) -> int:
+    if set(aggregation) <= {"numerator", "denominator", "ratio"}:
+        return 1
+    if set(aggregation) <= {"count", "field", "min_value", "max_value", "start", "end", "record_ids"}:
+        return int(aggregation.get("count", 0) or 0)
+    return len(aggregation)
+
+
+def retrieval_input_refs(corpus: SilverCorpus, filters: dict[str, Any]) -> list[str]:
+    if not filters:
+        return ["silver:*", "chunk:*"]
+    return [f"silver:{record['call_id']}" for record in corpus.query_silver(filters)]
 
 
 def bounded_limit(value: Any, *, default: int) -> int:
@@ -1271,7 +1369,7 @@ def infer_column_requests(
     plan: QueryPlan,
     records: list[dict[str, Any]],
     chunks: list[dict[str, Any]],
-    aggregation: dict[str, int],
+    aggregation: dict[str, Any],
     search_failures: list[dict[str, Any]],
 ) -> list[ColumnRequest]:
     fields = {field["name"] for field in catalog.get("fields", [])}

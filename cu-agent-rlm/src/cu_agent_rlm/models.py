@@ -95,6 +95,8 @@ class ContentUnderstandingArtifact:
     extractions: list[FieldExtraction]
     extraction_contract: dict[str, Any]
     quality_report: dict[str, Any]
+    field_candidates: list[dict[str, Any]]
+    schema_negotiation: dict[str, Any]
     feedback_report: dict[str, Any]
     silver_schema_catalog: dict[str, Any]
     silver_calls: list[SilverCallRecord]

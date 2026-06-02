@@ -50,6 +50,7 @@ from qu_agent_rlm.query_tasks import (
 )
 from qu_agent_rlm.replay import redact_for_replay
 from qu_agent_rlm.retrieval import DEFAULT_EMBEDDING_MODEL, OpenAIEmbeddingClient
+from qu_agent_rlm.schema_negotiation import evaluate_field_candidates
 from qu_agent_rlm.usage import budget_unpriced_warning
 from qu_agent_rlm.retrieval_agent import AgenticRetrievalSubAgent, SearchExecutionPolicy
 
@@ -153,6 +154,7 @@ def main() -> int:
     baseline_dir = args.output_root / "01_cu_baseline"
     query_tasks_path = args.output_root / "02_qu_feedback" / "query_tasks.jsonl"
     query_bootstrap_path = args.output_root / "02_qu_feedback" / "query_bootstrap.json"
+    field_candidate_eval_path = args.output_root / "02_qu_feedback" / "field_candidate_evaluation.json"
     feedback_path = args.output_root / "02_qu_feedback" / "column_requests.jsonl"
     baseline_answer_path = args.output_root / "02_qu_feedback" / "baseline_answer.json"
     baseline_answers_dir = args.output_root / "02_qu_feedback" / "baseline_answers"
@@ -182,6 +184,8 @@ def main() -> int:
         query_tasks, bootstrap_report = build_query_tasks(args, baseline_dir=baseline_dir, loop_id=loop_id)
     write_query_tasks_jsonl(query_tasks_path, query_tasks)
     write_json(query_bootstrap_path, bootstrap_report_to_dict(bootstrap_report, query_tasks))
+    candidate_evaluation = evaluate_field_candidates(SilverCorpus.from_dir(baseline_dir), query_tasks=query_tasks)
+    write_json(field_candidate_eval_path, candidate_evaluation)
     tui.show_query_tasks(query_tasks, bootstrap_report, query_tasks_path)
     orchestration_events.append(
         orchestration_event(
@@ -191,12 +195,17 @@ def main() -> int:
             agent="orchestrator",
             event_type="query_tasks.created",
             input_artifacts={"cu_output": str(baseline_dir)},
-            output_artifacts={"query_tasks": str(query_tasks_path), "query_bootstrap": str(query_bootstrap_path)},
+            output_artifacts={
+                "query_tasks": str(query_tasks_path),
+                "query_bootstrap": str(query_bootstrap_path),
+                "field_candidate_evaluation": str(field_candidate_eval_path),
+            },
             metrics={"task_count": len(query_tasks), "source_counts": query_source_counts(query_tasks)},
             decision={
                 "bootstrap": bootstrap_report_to_dict(bootstrap_report, query_tasks),
                 "generated_task_ids": [task["task_id"] for task in query_tasks if task.get("generation_id")],
                 "adjusted_for": first_adjusted_for(query_tasks),
+                "field_candidate_decisions": candidate_evaluation.get("evaluations", []),
             },
             summary="The orchestrator prepared downstream primary queries for QU replay.",
         )
@@ -305,6 +314,7 @@ def main() -> int:
         refined_answers=refined_answers,
     )
     summary["artifacts"]["orchestration_trace"] = str(orchestration_trace_path)
+    summary["artifacts"]["field_candidate_evaluation"] = str(field_candidate_eval_path)
     orchestration_events.append(
         orchestration_event(
             loop_id=loop_id,

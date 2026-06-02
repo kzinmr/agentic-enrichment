@@ -43,7 +43,7 @@ def prompt_hash(system: str, user: str) -> str:
 
 QUERY_PLANNER_PROMPT = PromptSpec(
     prompt_id="qu.query_planner",
-    version="2026-06-01.1",
+    version="2026-06-02.1",
     role="planner",
     system="""You are a query-understanding planner for a call-record silver dataset.
 Return only a JSON object with this shape:
@@ -51,13 +51,14 @@ Return only a JSON object with this shape:
   "operation": "filter" | "aggregate" | "search",
   "filters": {"field_name": "value or boolean or list item"},
   "group_by": "field_name or null",
+  "aggregation_expression": "optional allowlisted aggregate expression or null",
   "retrieve_evidence": true,
   "ranking_query": "short retrieval query",
   "reasoning": "one short sentence",
   "steps": [
     {
       "tool": "bm25_search_chunks | embedding_search_chunks | search_chunks | query_silver | aggregate_silver | fetch_chunks | review_schema_gaps",
-      "arguments": {"query": "optional query", "queries": ["optional parallel subqueries"], "filters": {}, "group_by": "optional field", "limit": 10},
+      "arguments": {"query": "optional query", "queries": ["optional parallel subqueries"], "filters": {}, "group_by": "optional field", "expression": "optional aggregate expression", "limit": 10},
       "purpose": "why this tool step is needed"
     }
   ],
@@ -76,6 +77,9 @@ Return only a JSON object with this shape:
 
 Rules:
 - Use "aggregate" when the user asks to count, compare distributions, break down, or group records.
+- For aggregate_silver, prefer group_by for simple counts. Use aggregation_expression only for top-k, ratios, date ranges, numeric ranges, nested group-by, or cohorts.
+- aggregation_expression is a single allowlisted expression over silver records only. Allowed functions: count(records), group_count(records, "field"), top_k(records, "field", k=5), nested_group_count(records, ["field_a", "field_b"]), count_if(records, "field", value), count_where(records, "field", ">=", value), numeric_range_count(records, "field", min_value=0, max_value=10), date_range_count(records, start="YYYY-MM-DD", end="YYYY-MM-DD"), cohort_count(records, date_granularity="month"), ratio(numerator, denominator).
+- Only reference fields marked aggregatable in aggregation_expression. Do not use Python builtins, imports, attribute access, comprehensions, eval, exec, or raw transcript text.
 - Use "filter" when the user asks for calls/accounts matching a specific silver field condition.
 - Use "search" when the request cannot be represented by known silver fields and needs semantic chunk retrieval.
 - Prefer multi-step plans: broad retrieval, silver filter/aggregate for structured work, fetch_chunks for evidence, then review_schema_gaps.
@@ -99,7 +103,7 @@ Rules:
 
 QUERY_REPLANNER_PROMPT = PromptSpec(
     prompt_id="qu.query_replanner",
-    version="2026-06-01.1",
+    version="2026-06-02.1",
     role="planner",
     system="""You are a query-understanding replanner for a call-record silver dataset.
 Return only a JSON object with the same shape as qu.query_planner:
@@ -107,13 +111,14 @@ Return only a JSON object with the same shape as qu.query_planner:
   "operation": "filter" | "aggregate" | "search",
   "filters": {"field_name": "value or boolean or list item"},
   "group_by": "field_name or null",
+  "aggregation_expression": "optional allowlisted aggregate expression or null",
   "retrieve_evidence": true,
   "ranking_query": "short retrieval query",
   "reasoning": "one short sentence based on the observation",
   "steps": [
     {
       "tool": "bm25_search_chunks | embedding_search_chunks | search_chunks | query_silver | aggregate_silver | fetch_chunks | review_schema_gaps",
-      "arguments": {"query": "optional query", "queries": ["optional parallel subqueries"], "filters": {}, "group_by": "optional field", "limit": 10},
+      "arguments": {"query": "optional query", "queries": ["optional parallel subqueries"], "filters": {}, "group_by": "optional field", "expression": "optional aggregate expression", "limit": 10},
       "purpose": "why this next step is needed"
     }
   ],
@@ -133,6 +138,7 @@ Return only a JSON object with the same shape as qu.query_planner:
 Rules:
 - Treat the observation as the source of truth: records, chunks, search failures, judge failure modes, and existing column_requests show what happened.
 - Prefer a different high-level route only when the observation justifies it: alternate retrieval terms/tools, a different silver filter, aggregation, or a constructive CU field proposal.
+- For aggregate replans that need top-k, ratios, date ranges, numeric ranges, nested group-by, or cohorts, use aggregation_expression with only the allowlisted aggregate functions and aggregatable fields from the catalog.
 - Do not force the query into an existing field when the observation shows the schema cannot represent the user's intent. In that case, use search for a best-effort answer and add column_requests that describe the better reusable field design.
 - If no additional execution is likely to help, keep steps limited to review_schema_gaps, set retrieve_evidence to false when evidence is already sufficient or unavailable, and emit the most useful column_requests.
 - Keep retrieval attempts diverse from prior search_calls and use "queries" for small parallel fan-out when several independent concepts need evidence.
