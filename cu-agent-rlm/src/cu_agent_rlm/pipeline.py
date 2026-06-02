@@ -31,6 +31,8 @@ from .models import (
     TraceEvent,
 )
 from .schema import HeuristicSchemaInducer, SchemaInducer
+from .schema_negotiation import build_field_candidates, build_schema_negotiation_report
+from .subagents import complete_field_candidate_call, field_candidate_subagent_call
 from .usage import usage_delta, usage_summary_from_components
 
 
@@ -218,6 +220,34 @@ def analyze_calls(
         "stop_reason": guardrails.stop_reason_value,
     }
     quality_report = build_quality_report(schema_specs, extractions, total_calls=len(calls))
+    field_candidates = build_field_candidates(schema_specs, quality_report, feedback)
+    field_candidate_call = field_candidate_subagent_call(
+        parent_id=manifest["dataset_id"],
+        input_refs=[f"chunk:{chunk.chunk_id}" for chunk in chunks[:24]],
+        field_count=len(schema_specs),
+        max_candidates=len(schema_specs),
+    )
+    field_candidate_result = complete_field_candidate_call(field_candidate_call, field_candidates)
+    trace.add(
+        "sub-rlm",
+        "field_candidate_proposal",
+        {
+            "subagent_call": field_candidate_result.to_dict(),
+            "candidate_count": len(field_candidates),
+        },
+        field_candidate_result.result_summary,
+        validation_result=field_candidate_result.validation_result,
+        fallback_reason=field_candidate_result.error or None,
+    )
+    if field_candidate_result.validation_result != "ok":
+        raise ValueError(field_candidate_result.error or "field candidate proposal failed validation")
+    schema_negotiation = build_schema_negotiation_report(field_candidates, quality_report, feedback)
+    manifest["schema_negotiation"] = {
+        "field_candidates": "field_candidates.json",
+        "schema_negotiation": "schema_negotiation.json",
+        "candidate_count": len(field_candidates),
+        "contract": schema_negotiation["contract"],
+    }
     promoted_specs = promoted_fields(schema_specs, quality_report)
     extraction_contract = build_extraction_contract(schema_specs, max_chunk_chars=max_chunk_chars)
     silver_calls = materialize_silver_calls(calls, promoted_specs, extractions)
@@ -249,6 +279,8 @@ def analyze_calls(
         extractions=extractions,
         extraction_contract=extraction_contract,
         quality_report=quality_report,
+        field_candidates=field_candidates,
+        schema_negotiation=schema_negotiation,
         feedback_report=feedback_report,
         silver_schema_catalog=catalog,
         silver_calls=silver_calls,
@@ -405,7 +437,7 @@ def build_manifest(
             "search_chunks": "Keyword/BM25-like local retrieval over chunk snippets; production maps to OpenSearch or Databricks vector index.",
             "fetch_chunks": "Resolve evidence refs to approved snippets or full text under access control.",
             "query_silver": "Filter materialized silver fields without loading raw transcripts.",
-            "aggregate_silver": "Group and count on fields marked aggregatable in silver_schema_catalog.json.",
+            "aggregate_silver": "Group/count or run allowlisted aggregate expressions over fields marked aggregatable in silver_schema_catalog.json.",
             "run_sql": "Production-only Databricks SELECT over call_records or the materialized silver view.",
         },
     }
@@ -589,7 +621,7 @@ def build_silver_schema_catalog(specs: list[FieldSpec], quality_report: dict[str
             "search_chunks": {"args": ["query", "filters", "limit"], "returns": ["chunk_id", "call_id", "snippet"]},
             "fetch_chunks": {"args": ["chunk_ids"], "returns": ["chunk_id", "call_id", "text"]},
             "query_silver": {"args": ["filters", "limit"], "returns": ["silver_call_records"]},
-            "aggregate_silver": {"args": ["group_by", "filters"], "returns": ["counts"]},
+            "aggregate_silver": {"args": ["group_by", "filters", "expression"], "returns": ["aggregation_result"]},
             "run_sql": {"args": ["select_sql"], "scope": "Databricks call_records or materialized silver view"},
         },
         "fields": [

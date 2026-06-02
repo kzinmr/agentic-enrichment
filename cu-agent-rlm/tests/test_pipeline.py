@@ -44,15 +44,25 @@ class ContentUnderstandingRLMTest(unittest.TestCase):
             self.assertTrue((output / "silver_calls.jsonl").exists())
             self.assertTrue((output / "rlm_trace.jsonl").exists())
             self.assertTrue((output / "extraction_contract.json").exists())
+            self.assertTrue((output / "field_candidates.json").exists())
+            self.assertTrue((output / "schema_negotiation.json").exists())
 
             self.assertEqual(artifact.manifest["schema_induction"]["inducer"], "heuristic")
             self.assertEqual(artifact.manifest["portable_extraction"]["contract"], "extraction_contract.json")
+            self.assertEqual(artifact.manifest["schema_negotiation"]["contract"], "cu.qu_schema_negotiation@2026-06-02.1")
             self.assertEqual(artifact.extraction_contract["runtime"]["module"], "portable_extractor")
             self.assertFalse(artifact.extraction_contract["runtime"]["imports_cu_agent_rlm"])
+            self.assertEqual(artifact.extraction_contract["aggregation"]["contract_id"], "qu.aggregate_silver.expression")
             field_names = {field["name"] for field in artifact.silver_schema_catalog["fields"]}
             self.assertIn("conversation_topic", field_names)
             self.assertIn("risk_or_blocker", field_names)
             self.assertIn("next_action", field_names)
+            candidate_names = {candidate["field_name"] for candidate in artifact.field_candidates}
+            self.assertIn("conversation_topic", candidate_names)
+            self.assertTrue(
+                any(decision["decision"] in artifact.schema_negotiation["decision_values"] for decision in artifact.schema_negotiation["decisions"])
+            )
+            self.assertIn("field_candidate_proposal", [event.tool for event in artifact.trace])
             self.assertIn("fetch_chunks", artifact.silver_schema_catalog["tools"])
             self.assertIn("run_sql", artifact.databricks_contract["allowlisted_tools"])
             self.assertIn("calllog_result", artifact.databricks_contract["source"]["observed_columns"])

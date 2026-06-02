@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import re
 from typing import Any, Protocol
 
+from .aggregation import validate_aggregation_expression
 from .llm import JSONChatClient, LLMError
 from .prompt_registry import QUERY_PLANNER_PROMPT, QUERY_REPLANNER_PROMPT, PromptRender
 
@@ -65,6 +66,7 @@ class QueryPlan:
     operation: str
     filters: dict[str, Any] = field(default_factory=dict)
     group_by: str | None = None
+    aggregation_expression: str | None = None
     retrieve_evidence: bool = True
     ranking_query: str = ""
     planner: str = "heuristic"
@@ -255,11 +257,21 @@ def plan_from_llm_payload(
         if not fields[group_by].get("search", {}).get("aggregatable", False):
             raise ValueError(f"LLM planner selected non-aggregatable group_by field: {group_by}")
 
-    if operation == "aggregate" and group_by is None:
-        raise ValueError("LLM planner selected aggregate without group_by")
+    aggregation_expression = payload.get("aggregation_expression")
+    if aggregation_expression in ("", "null"):
+        aggregation_expression = None
+    if aggregation_expression is not None:
+        if not isinstance(aggregation_expression, str):
+            raise ValueError("aggregation_expression must be a string")
+        aggregation_expression = aggregation_expression.strip()
+        validate_aggregation_expression(aggregation_expression, fields)
+
+    if operation == "aggregate" and group_by is None and aggregation_expression is None:
+        raise ValueError("LLM planner selected aggregate without group_by or aggregation_expression")
     if operation == "search":
         filters = {}
         group_by = None
+        aggregation_expression = None
 
     retrieve_evidence = payload.get("retrieve_evidence", True)
     if not isinstance(retrieve_evidence, bool):
@@ -277,6 +289,7 @@ def plan_from_llm_payload(
         operation=operation,
         filters=filters,
         group_by=group_by,
+        aggregation_expression=aggregation_expression,
         retrieve_evidence=retrieve_evidence,
         ranking_query=ranking_query,
         planner=planner,
@@ -312,7 +325,7 @@ def default_steps_for_plan(plan: QueryPlan) -> list[QueryToolStep]:
             [
                 QueryToolStep(
                     tool="aggregate_silver",
-                    arguments={"group_by": plan.group_by, "filters": plan.filters},
+                    arguments=aggregate_step_arguments(plan),
                     purpose="Compute the requested grouped count on silver fields.",
                 ),
                 QueryToolStep(
@@ -370,6 +383,15 @@ def default_steps_for_plan(plan: QueryPlan) -> list[QueryToolStep]:
     ]
 
 
+def aggregate_step_arguments(plan: QueryPlan) -> dict[str, Any]:
+    arguments: dict[str, Any] = {"filters": plan.filters}
+    if plan.group_by:
+        arguments["group_by"] = plan.group_by
+    if plan.aggregation_expression:
+        arguments["expression"] = plan.aggregation_expression
+    return arguments
+
+
 def validate_steps(raw_steps: Any, plan: QueryPlan, fields: dict[str, dict[str, Any]]) -> list[QueryToolStep]:
     if raw_steps in (None, ""):
         return []
@@ -387,6 +409,8 @@ def validate_steps(raw_steps: Any, plan: QueryPlan, fields: dict[str, dict[str, 
             arguments = {}
         if not isinstance(arguments, dict):
             raise ValueError(f"arguments for {tool} must be an object")
+        if tool == "aggregate_silver":
+            arguments = {**aggregate_step_arguments(plan), **arguments}
         arguments = validate_step_arguments(tool, arguments, fields)
         purpose = raw.get("purpose", "")
         steps.append(QueryToolStep(tool=tool, arguments=arguments, purpose=purpose if isinstance(purpose, str) else ""))
@@ -448,11 +472,25 @@ def validate_step_arguments(tool: str, arguments: dict[str, Any], fields: dict[s
         else:
             validated.pop("queries")
     if tool == "aggregate_silver":
+        expression = validated.get("expression")
+        if expression in ("", "null"):
+            expression = None
+            validated.pop("expression", None)
+        if expression is not None:
+            if not isinstance(expression, str):
+                raise ValueError("aggregate_silver expression must be a string")
+            expression = expression.strip()
+            validate_aggregation_expression(expression, fields)
+            validated["expression"] = expression
         group_by = validated.get("group_by")
-        if not isinstance(group_by, str) or group_by not in fields:
+        if group_by in (None, "", "null"):
+            validated.pop("group_by", None)
+        elif not isinstance(group_by, str) or group_by not in fields:
             raise ValueError(f"aggregate_silver needs a valid group_by field: {group_by}")
-        if not fields[group_by].get("search", {}).get("aggregatable", False):
+        elif not fields[group_by].get("search", {}).get("aggregatable", False):
             raise ValueError(f"aggregate_silver selected non-aggregatable field: {group_by}")
+        if "group_by" not in validated and "expression" not in validated:
+            raise ValueError("aggregate_silver needs group_by or expression")
     if "limit" in validated:
         try:
             validated["limit"] = max(1, min(int(validated["limit"]), 100))

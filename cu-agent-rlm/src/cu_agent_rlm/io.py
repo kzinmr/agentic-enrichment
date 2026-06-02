@@ -125,6 +125,14 @@ def write_artifact(artifact: ContentUnderstandingArtifact, output_dir: Path) -> 
         json.dumps(artifact.feedback_report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    (output_dir / "field_candidates.json").write_text(
+        json.dumps(artifact.field_candidates, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (output_dir / "schema_negotiation.json").write_text(
+        json.dumps(artifact.schema_negotiation, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     (output_dir / "silver_schema_catalog.json").write_text(
         json.dumps(artifact.silver_schema_catalog, ensure_ascii=False, indent=2),
         encoding="utf-8",
