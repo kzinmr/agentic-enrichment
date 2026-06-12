@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>機序図解 — Agentic Enrichment Demo</title>
+<style>
+:root{
+  --paper:#f5f0e3; --paper2:#efe8d6; --ink:#23272f; --sub:#5d6068; --faint:#9a948a;
+  --line:#d9d1bd; --line2:#c6bda5;
+  --shu:#c8401f; --shu-soft:rgba(200,64,31,.08);
+  --ai:#2c5d63; --ai-soft:rgba(44,93,99,.08);
+  --ki:#a8731e;
+  --mono:"SF Mono","Cascadia Code",Menlo,Consolas,"Osaka-Mono",monospace;
+  --sans:"Hiragino Mincho ProN","Yu Mincho","Hiragino Sans",serif;
+  --goth:"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic UI",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:
+    radial-gradient(1000px 400px at 110% -5%, rgba(200,64,31,.05), transparent 55%),
+    repeating-linear-gradient(90deg, transparent 0 96px, rgba(35,39,47,.022) 96px 97px),
+    var(--paper);
+  color:var(--ink); font-family:var(--goth); font-size:14.5px; line-height:1.95;
+}
+.page{max-width:1060px;margin:0 auto;padding:0 30px 14vh;display:grid;
+  grid-template-columns:188px 1fr;gap:44px}
+@media(max-width:880px){.page{grid-template-columns:1fr}nav.toc{display:none}}
+.micro{font-family:var(--mono);font-size:10px;letter-spacing:.24em;text-transform:uppercase;color:var(--faint)}
+code,.mono{font-family:var(--mono);font-size:.92em;background:var(--paper2);
+  border:1px solid var(--line);padding:1px 6px;border-radius:0;color:#7a3022}
+.num{font-variant-numeric:tabular-nums}
+
+/* ---- toc ---- */
+nav.toc{position:sticky;top:34px;align-self:start;border-top:3px solid var(--ink);padding-top:16px}
+nav.toc .micro{display:block;margin-bottom:12px}
+nav.toc a{display:block;color:var(--sub);text-decoration:none;font-size:12px;
+  padding:5px 0 5px 14px;border-left:1px solid var(--line);line-height:1.5}
+nav.toc a:hover{color:var(--shu);border-left-color:var(--shu)}
+nav.toc a b{font-family:var(--mono);font-size:10px;color:var(--faint);margin-right:8px}
+
+/* ---- header ---- */
+header{grid-column:1/-1;padding:54px 0 30px;border-bottom:3px double var(--line2);margin-bottom:40px}
+.suptitle{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:10px}
+h1{font-family:var(--sans);font-weight:600;font-size:clamp(30px,4.5vw,46px);
+  letter-spacing:.06em;margin:14px 0 10px}
+h1 .seal{display:inline-block;font-family:var(--goth);font-size:13px;font-weight:600;color:#fff;
+  background:var(--shu);padding:4px 9px;letter-spacing:.2em;transform:translateY(-8px);margin-left:14px}
+.lead{max-width:48em;color:var(--sub);font-size:13.5px}
+.lead a{color:var(--shu)}
+
+/* ---- sections ---- */
+main{min-width:0}
+section{margin-bottom:64px}
+.sec-head{display:flex;align-items:baseline;gap:16px;border-bottom:1px solid var(--line2);
+  padding-bottom:8px;margin-bottom:20px}
+.sec-no{font-family:var(--sans);font-size:15px;color:var(--shu);letter-spacing:.1em;white-space:nowrap}
+h2{font-family:var(--sans);font-weight:600;font-size:23px;letter-spacing:.05em}
+h3{font-family:var(--goth);font-size:14px;margin:26px 0 8px;letter-spacing:.04em}
+p{margin:10px 0;max-width:46em}
+p.note{font-size:12px;color:var(--sub);border-left:3px solid var(--ki);
+  background:rgba(168,115,30,.07);padding:9px 16px;max-width:none}
+strong{color:var(--shu);font-weight:600}
+
+/* ---- diagram ---- */
+.diagram{border:1px solid var(--line2);background:#faf6ec;padding:10px;overflow-x:auto}
+.diagram svg{display:block;min-width:760px;width:100%}
+.cap{font-size:11px;color:var(--faint);margin-top:8px;text-align:right;font-family:var(--mono)}
+
+/* ---- tables ---- */
+table{border-collapse:collapse;width:100%;font-size:12.5px;margin:14px 0}
+th,td{border:1px solid var(--line2);padding:9px 13px;text-align:left;vertical-align:top}
+thead th{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;color:var(--sub);
+  background:var(--paper2);font-weight:500}
+td .mono,th .mono{background:transparent;border:0;padding:0}
+tr:hover td{background:rgba(200,64,31,.03)}
+
+/* ---- file tree ---- */
+pre.tree{font-family:var(--mono);font-size:12px;line-height:1.9;background:#faf6ec;
+  border:1px solid var(--line2);padding:18px 22px;overflow-x:auto;color:var(--ink)}
+pre.tree b{color:var(--shu);font-weight:500}
+pre.tree i{color:var(--faint);font-style:normal}
+
+/* ---- flow cards ---- */
+.steps{counter-reset:s;display:grid;gap:0;border:1px solid var(--line2)}
+.step{counter-increment:s;display:grid;grid-template-columns:54px 170px 1fr;
+  border-bottom:1px solid var(--line2);background:#faf6ec}
+.step:last-child{border-bottom:0}
+.step::before{content:counter(s,decimal-leading-zero);font-family:var(--mono);font-size:13px;
+  color:var(--shu);padding:14px 0 0 16px}
+.step .nm{font-family:var(--mono);font-size:12px;padding:14px 10px;color:var(--ink)}
+.step .ds{font-size:12.5px;color:var(--sub);padding:14px 18px 14px 0;line-height:1.8}
+.step .ds em{font-style:normal;color:var(--ink);border-bottom:1px solid var(--line2)}
+
+.duo{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+@media(max-width:760px){.duo{grid-template-columns:1fr}}
+.panel{border:1px solid var(--line2);background:#faf6ec;padding:16px 20px}
+.panel .t{font-family:var(--mono);font-size:11px;letter-spacing:.14em;margin-bottom:8px}
+.panel.in .t{color:var(--ai)} .panel.out .t{color:var(--shu)}
+.panel ul{list-style:none}
+.panel li{font-size:12.5px;color:var(--sub);padding:5px 0 5px 16px;position:relative;line-height:1.7}
+.panel li::before{content:"—";position:absolute;left:0;color:var(--faint)}
+footer{grid-column:1/-1;border-top:3px double var(--line2);margin-top:30px;padding-top:16px;
+  font-family:var(--mono);font-size:10px;letter-spacing:.14em;color:var(--faint)}
+</style>
+</head>
+<body>
+<div class="page">
+<header>
+  <div class="suptitle">
+    <span class="micro">Agentic Enrichment Demo — README 補足資料</span>
+    <span class="micro">docs/architecture.html</span>
+  </div>
+  <h1>機序図解<span class="seal">機序</span></h1>
+  <p class="lead">
+    通話文字起こしに対して「仮説 intent &amp; query の幅だし」と「導出スキーマの誘導」を交互に提案・検証する
+    enrichment ループの内部機序とデータフローを図解する。実行結果の可視化は
+    <a href="sample_dashboard.html">実行計器盤 (sample_dashboard.html)</a> を、
+    運用手順は README を参照。
+  </p>
+</header>
+
+<nav class="toc">
+  <span class="micro">目次</span>
+  <a href="#flow"><b>壱</b>全体データフロー</a>
+  <a href="#llm"><b>弐</b>5つのLLM呼び出し</a>
+  <a href="#coupling"><b>参</b>結合の仕組み</a>
+  <a href="#gate"><b>四</b>evidenceゲート</a>
+  <a href="#engine"><b>伍</b>決定論実行エンジン</a>
+  <a href="#feedback"><b>六</b>2系統のフィードバック</a>
+  <a href="#artifacts"><b>七</b>成果物ファイルマップ</a>
+  <a href="#metrics"><b>八</b>指標の読み方</a>
+  <a href="#viz"><b>九</b>可視化機構</a>
+</nav>
+
+<main>
+<!-- ======================= 1. flow ======================= -->
+<section id="flow">
+  <div class="sec-head"><span class="sec-no">第壱節</span><h2>全体データフロー</h2></div>
+  <p>
+    1 イテレーションは 5 段で構成される。<strong>意味判断は LLM</strong>（朱の段）、
+    <strong>実行と検証は決定論</strong>（藍の段）に分離されており、
+    各段の出力はすべて JSON artifact として残る。
+  </p>
+  <div class="diagram">
+  <svg viewBox="0 0 940 560" xmlns="http://www.w3.org/2000/svg" font-family="SF Mono,Menlo,monospace">
+    <defs>
+      <marker id="ar" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L8,4 L0,8 z" fill="#5d6068"/></marker>
+      <marker id="arR" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L8,4 L0,8 z" fill="#c8401f"/></marker>
+      <marker id="arK" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L8,4 L0,8 z" fill="#a8731e"/></marker>
+    </defs>
+    <!-- inputs -->
+    <g font-size="11">
+      <rect x="20" y="28" width="218" height="92" fill="#faf6ec" stroke="#c6bda5"/>
+      <text x="34" y="50" fill="#9a948a" font-size="9" letter-spacing="2">INPUTS</text>
+      <text x="34" y="70" fill="#23272f">business_profile.json</text>
+      <text x="34" y="88" fill="#23272f">sample_calls.jsonl</text>
+      <text x="34" y="106" fill="#a8731e">production_log.jsonl ※運用開始後</text>
+    </g>
+    <!-- corpus prep -->
+    <g font-size="11">
+      <rect x="300" y="36" width="190" height="76" fill="#faf6ec" stroke="#2c5d63"/>
+      <text x="314" y="56" fill="#2c5d63" font-size="9" letter-spacing="2">決定論</text>
+      <text x="314" y="76" fill="#23272f">chunks 化 / digest</text>
+      <text x="314" y="94" fill="#5d6068" font-size="10">sampling: summary|snippet|search</text>
+    </g>
+    <line x1="238" y1="74" x2="298" y2="74" stroke="#5d6068" marker-end="url(#ar)"/>
+    <!-- loop box -->
+    <rect x="20" y="150" width="900" height="290" fill="none" stroke="#c6bda5" stroke-dasharray="5 4"/>
+    <text x="36" y="172" fill="#9a948a" font-size="9" letter-spacing="2">ITERATION i (有界ループ・既定2回)</text>
+    <!-- 5 stages -->
+    <g font-size="11">
+      <rect x="40"  y="195" width="156" height="100" fill="rgba(200,64,31,.07)" stroke="#c8401f"/>
+      <text x="52" y="216" fill="#c8401f" font-size="9" letter-spacing="2">LLM ①</text>
+      <text x="52" y="237" fill="#23272f" font-weight="bold">ideation</text>
+      <text x="52" y="256" fill="#5d6068" font-size="10">intent &amp; query</text>
+      <text x="52" y="272" fill="#5d6068" font-size="10">の幅だし提案</text>
+
+      <rect x="216" y="195" width="156" height="100" fill="rgba(200,64,31,.07)" stroke="#c8401f"/>
+      <text x="228" y="216" fill="#c8401f" font-size="9" letter-spacing="2">LLM ②</text>
+      <text x="228" y="237" fill="#23272f" font-weight="bold">induction</text>
+      <text x="228" y="256" fill="#5d6068" font-size="10">スキーマ誘導</text>
+      <text x="228" y="272" fill="#c8401f" font-size="10">serves_intents 必須</text>
+
+      <rect x="392" y="195" width="156" height="100" fill="rgba(200,64,31,.07)" stroke="#c8401f"/>
+      <text x="404" y="216" fill="#c8401f" font-size="9" letter-spacing="2">LLM ③ ×N並列</text>
+      <text x="404" y="237" fill="#23272f" font-weight="bold">extraction</text>
+      <text x="404" y="256" fill="#5d6068" font-size="10">通話ごとに抽出</text>
+      <text x="404" y="272" fill="#2c5d63" font-size="10">evidence ゲート</text>
+
+      <rect x="568" y="195" width="156" height="100" fill="rgba(44,93,99,.08)" stroke="#2c5d63"/>
+      <text x="580" y="216" fill="#2c5d63" font-size="9" letter-spacing="2">LLM ④⑤ + 決定論</text>
+      <text x="580" y="237" fill="#23272f" font-weight="bold">trials</text>
+      <text x="580" y="256" fill="#5d6068" font-size="10">compile → 実行</text>
+      <text x="580" y="272" fill="#5d6068" font-size="10">→ judge</text>
+
+      <rect x="744" y="195" width="156" height="100" fill="rgba(44,93,99,.08)" stroke="#2c5d63"/>
+      <text x="756" y="216" fill="#2c5d63" font-size="9" letter-spacing="2">決定論</text>
+      <text x="756" y="237" fill="#23272f" font-weight="bold">gap analysis</text>
+      <text x="756" y="256" fill="#5d6068" font-size="10">結合検証・重み付き</text>
+      <text x="756" y="272" fill="#5d6068" font-size="10">指標・要求の集約</text>
+    </g>
+    <line x1="196" y1="245" x2="214" y2="245" stroke="#5d6068" marker-end="url(#ar)"/>
+    <line x1="372" y1="245" x2="390" y2="245" stroke="#5d6068" marker-end="url(#ar)"/>
+    <line x1="548" y1="245" x2="566" y2="245" stroke="#5d6068" marker-end="url(#ar)"/>
+    <line x1="724" y1="245" x2="742" y2="245" stroke="#5d6068" marker-end="url(#ar)"/>
+    <line x1="395" y1="112" x2="430" y2="193" stroke="#5d6068" marker-end="url(#ar)"/>
+    <line x1="118" y1="120" x2="110" y2="193" stroke="#5d6068" marker-end="url(#ar)"/>
+    <!-- artifacts row -->
+    <g font-size="10" fill="#5d6068">
+      <text x="60"  y="330">intents.json</text>
+      <text x="232" y="330">schema.json</text>
+      <text x="400" y="330">silver_records.jsonl</text>
+      <text x="592" y="330">trials.json</text>
+      <text x="754" y="330">gap_signals.json</text>
+      <line x1="112" y1="297" x2="112" y2="318" stroke="#c6bda5"/>
+      <line x1="288" y1="297" x2="288" y2="318" stroke="#c6bda5"/>
+      <line x1="464" y1="297" x2="464" y2="318" stroke="#c6bda5"/>
+      <line x1="640" y1="297" x2="640" y2="318" stroke="#c6bda5"/>
+      <line x1="816" y1="297" x2="816" y2="318" stroke="#c6bda5"/>
+    </g>
+    <!-- feedback arc -->
+    <path d="M 816 340 C 816 408, 480 416, 130 408 C 110 407, 105 390, 108 300"
+          fill="none" stroke="#c8401f" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#arR)"/>
+    <text x="330" y="398" fill="#c8401f" font-size="10.5">signals = field_requests / 未回答クエリ / query_revisions / 重み付き指標 → 次イテレーションの ①② へ</text>
+    <!-- production feedback -->
+    <path d="M 128 106 C 60 200, 50 330, 96 396" fill="none" stroke="#a8731e"
+          stroke-width="1.2" stroke-dasharray="2 4" marker-end="url(#arK)"/>
+    <text x="30" y="470" fill="#a8731e" font-size="10.5">運用履歴は load_production_log で正規化され、ループ内フィードバックと同じ signals 形式に合流</text>
+    <text x="30" y="490" fill="#a8731e" font-size="10.5">(クエリは weight=asked_count 付きで trials にも参加する)</text>
+    <!-- outputs -->
+    <g font-size="11">
+      <rect x="560" y="470" width="360" height="66" fill="#faf6ec" stroke="#c6bda5"/>
+      <text x="574" y="490" fill="#9a948a" font-size="9" letter-spacing="2">RUN OUTPUTS</text>
+      <text x="574" y="508" fill="#23272f">manifest.json / loop_summary.json / trace.jsonl</text>
+      <text x="574" y="524" fill="#23272f">report.md / dashboard.html (viz)</text>
+    </g>
+    <line x1="822" y1="340" x2="822" y2="468" stroke="#5d6068" marker-end="url(#ar)"/>
+  </svg>
+  </div>
+  <div class="cap">図1: 1イテレーションの機序。朱=LLM意味判断 / 藍=決定論 / 黄土=運用履歴の合流</div>
+</section>
+
+<!-- ======================= 2. llm ======================= -->
+<section id="llm">
+  <div class="sec-head"><span class="sec-no">第弐節</span><h2>5つのLLM呼び出し</h2></div>
+  <p>
+    semantic な判断は <code>prompts.py</code> に定義された 5 種類のみ。
+    すべて JSON mode で呼ばれ、<strong>コード側 validator が ValueError を投げると
+    エラー文を添えて最大 3 回の修復リトライ</strong>が走る（ヒューリスティック fallback は持たない）。
+    プロンプトはコード定数であり、変更は git の PR ＝人間レビューを必ず通る。
+  </p>
+  <table>
+    <thead><tr><th>prompt_id</th><th>役割</th><th>主な入力</th><th>validator が強制する契約</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">ideation.intent_queries@v1</td><td>仮説 intent &amp; query の幅だし</td>
+        <td>業務プロファイル / コーパス概況 / 前回 intents / signals</td>
+        <td>intent_id の snake_case と安定性、operation 3種、クエリのプレースホルダ禁止</td></tr>
+      <tr><td class="mono">induction.schema@v1</td><td>導出スキーマの誘導</td>
+        <td>intents+queries / 文字起こしサンプル / 前回スキーマ / signals</td>
+        <td><strong>serves_intents 必須</strong>、予約語排除、enum への not_mentioned 注入</td></tr>
+      <tr><td class="mono">extraction.call_fields@v1</td><td>通話1件のフィールド抽出</td>
+        <td>field_specs / その通話の chunks</td>
+        <td>evidence_chunk_ids ⊂ 提示 chunk、語彙外値の矯正と記録</td></tr>
+      <tr><td class="mono">query.compile@v1</td><td>クエリ→実行プラン変換</td>
+        <td>クエリ / カタログ(active+メタ列) / corpus_stats</td>
+        <td>未知フィールド・語彙外値・プレースホルダ日付の拒否</td></tr>
+      <tr><td class="mono">trial.judge@v1</td><td>実行結果の回答可否判定</td>
+        <td>クエリ / プラン / 実行結果(行・集計・根拠)</td>
+        <td>failure_modes の閉集合、field_requests / query_revision の正規化</td></tr>
+    </tbody>
+  </table>
+  <p class="note">
+    旧プロトタイプ (cu-agent-rlm / qu-agent-rlm) の retrieval controller・reranker・typed subagent
+    contract は撤廃した。subagent を再導入するのは「別モデル・別プロセス・別SLA / 非同期 worker /
+    プロセス境界での権限分離 / 独立デプロイ」のいずれかが実需になったときのみ。
+  </p>
+</section>
+
+<!-- ======================= 3. coupling ======================= -->
+<section id="coupling">
+  <div class="sec-head"><span class="sec-no">第参節</span><h2>結合の仕組み — intent ⇄ field</h2></div>
+  <p>
+    本デモの中心主張は「2つの成果物（intent &amp; query / スキーマ）が
+    <strong>有機的に結合し、毎イテレーション検証される</strong>」こと。結合は宣言と観測の二重で担保される。
+  </p>
+  <div class="steps">
+    <div class="step"><span class="nm">宣言 (静的)</span><span class="ds">
+      全フィールドは <em>serves_intents</em>（支える intent_id のリスト）を必須で宣言する。
+      既知 intent に紐づかないフィールドは validator が機械的に落とし、
+      <em>schema.json の dropped_fields</em> に記録される。</span></div>
+    <div class="step"><span class="nm">観測 (動的)</span><span class="ds">
+      全仮説クエリを実際に compile → 実行 → judge し、プランが参照したフィールドを
+      <em>intent 別</em>と全体の両方で集計する（by_intent / used_by_plans）。
+      「宣言上は支えているが、その intent のクエリでは一度も使われていない」状態が観測できる。</span></div>
+    <div class="step"><span class="nm">警告 (自動)</span><span class="ds">
+      ①active な支えフィールドが無い ②intent 内クエリでフィールド未使用
+      ③高 priority で回答率 50% 未満 — のいずれかに該当する intent は
+      <em>結合不全 (failing coupling)</em> としてレポートとダッシュボードに明示される。</span></div>
+    <div class="step"><span class="nm">還流 (次周)</span><span class="ds">
+      judge は schema 側への <em>field_requests</em> と query 側への <em>query_revision</em>
+      の両方向の改善提案を出し、次イテレーションの ideation / induction の双方に渡る。</span></div>
+  </div>
+</section>
+
+<!-- ======================= 4. gate ======================= -->
+<section id="gate">
+  <div class="sec-head"><span class="sec-no">第四節</span><h2>evidence ゲート — 根拠なき値は昇格しない</h2></div>
+  <p>
+    旧プロトタイプから継承した最重要の安全装置。LLM が「それっぽい値」を出しただけでは
+    クエリ基盤に乗らない。
+  </p>
+  <div class="steps">
+    <div class="step"><span class="nm">白名単検証</span><span class="ds">
+      抽出値の <em>evidence_chunk_ids</em> は、その通話で LLM に提示した chunk_id 集合内に限定。
+      提示外の参照は除外され validation_errors に残る（hallucination 防御）。</span></div>
+    <div class="step"><span class="nm">coverage 計測</span><span class="ds">
+      フィールドごとに fill_rate（値が付いた率）と
+      <em>evidence_coverage</em>（値のうち根拠付きの率）を計測する。</span></div>
+    <div class="step"><span class="nm">昇格判定</span><span class="ds">
+      <em>evidence_coverage ≥ 0.75</em>（設定可）を満たさないフィールドは
+      <em>status: hold</em> に降格し、クエリの compile カタログから外れる。
+      hold のままでも silver 行には値が残るため、次イテレーションで改善されれば自動復帰する。</span></div>
+  </div>
+  <p class="note">
+    通話レコードが元から持つメタ列（<code>date</code> / <code>direction</code>）は誘導対象ではなく
+    組み込みカタログフィールドとして常時 filter / aggregate に使える。PII redaction は
+    本ツールより上流（データ側）で実施済みであることを入力契約とする。
+  </p>
+</section>
+
+<!-- ======================= 5. engine ======================= -->
+<section id="engine">
+  <div class="sec-head"><span class="sec-no">第伍節</span><h2>決定論実行エンジン</h2></div>
+  <p>
+    プランの実行に LLM は関与しない。操作は 3 種に固定され、本番接続時は
+    この 3 操作のインターフェイスを Databricks / OpenSearch 等へ差し替える。
+  </p>
+  <table>
+    <thead><tr><th>操作</th><th>実装</th><th>備考</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">filter</td><td>silver 行のフィルタ</td>
+        <td>op: eq / neq / in / contains / not_empty / gte / lte。
+        date は YYYY-MM 前方一致と gte/lte 範囲に対応</td></tr>
+      <tr><td class="mono">aggregate</td><td>group_by 件数集計</td>
+        <td>list 型は値ごとに展開、空値は not_mentioned 群に集約</td></tr>
+      <tr><td class="mono">search</td><td>純 Python BM25</td>
+        <td>CJK は文字 bigram + 英数単語トークン（日本語対応）。
+        matched_terms を返し judge の説明可能性を支える</td></tr>
+    </tbody>
+  </table>
+  <p>
+    構造化フィルタがゼロヒットの場合は元クエリで BM25 フォールバック検索を行い、
+    judge が「データが無い」のか「抽出・語彙が外れている (improve_extraction)」のかを
+    区別できる候補根拠を渡す。compile 自体が失敗した場合は常に実行可能な search
+    プランへ退避し、その発生率は <code>compiled_structurally_rate</code> として計測される。
+  </p>
+</section>
+
+<!-- ======================= 6. feedback ======================= -->
+<section id="feedback">
+  <div class="sec-head"><span class="sec-no">第六節</span><h2>2系統のフィードバック</h2></div>
+  <div class="duo">
+    <div class="panel in">
+      <div class="t">ループ内 — judge 由来</div>
+      <ul>
+        <li>field_requests（add_field / add_allowed_values / improve_extraction）</li>
+        <li>未回答クエリと failure_modes</li>
+        <li>query_revision（keep / revise / drop）</li>
+        <li>hold フィールドと未使用 promoted フィールド</li>
+      </ul>
+    </div>
+    <div class="panel out">
+      <div class="t">ループ外 — 運用履歴由来</div>
+      <ul>
+        <li>production_log.jsonl（query / asked_count / outcome / operator_note）</li>
+        <li>クエリは weight=asked_count 付きで trials に合流</li>
+        <li>頻度が高く未回答のクエリは intent 化の優先入力に</li>
+        <li>operator_note はスキーマ改善要求として induction へ</li>
+      </ul>
+    </div>
+  </div>
+  <p style="margin-top:14px">
+    両系統は <code>build_next_signals()</code> で<strong>同一の signals 形式に正規化</strong>され、
+    ideation と induction の同じ入口に入る。本番接続は「検索 UI のクエリログと成否評価を
+    この JSONL に落とす」だけでよい。評価側も <code>asked_count</code> を重みとして使い、
+    頻度 11 回の未回答運用クエリが 1 回限りの仮説クエリと同じ重みに薄まることはない。
+  </p>
+</section>
+
+<!-- ======================= 7. artifacts ======================= -->
+<section id="artifacts">
+  <div class="sec-head"><span class="sec-no">第七節</span><h2>成果物ファイルマップ</h2></div>
+<pre class="tree">output/&lt;run&gt;/
+├── <b>manifest.json</b>            <i>run_id / prompt hash / 入力 hash / 設定 — 再現性アンカー</i>
+├── chunks.jsonl              <i>検索可能チャンク (evidence 参照の解決先)</i>
+├── production_signals.json   <i>運用履歴の正規化結果 (--production-log 時)</i>
+├── iter_01/ iter_02/ …
+│   ├── <b>intents.json</b>         <i>成果物1: 仮説 intent &amp; query</i>
+│   ├── <b>schema.json</b>          <i>成果物2: 導出スキーマ (serves_intents / dropped_fields)</i>
+│   ├── silver_records.jsonl  <i>通話ごとの構造化行 + evidence + confidence</i>
+│   ├── quality_report.json   <i>fill_rate / evidence_coverage / 昇格判定</i>
+│   ├── trials.json           <i>全クエリの plan / 実行結果 / judgement</i>
+│   └── gap_signals.json      <i>ギャップ分析 = 次イテレーションへの signals 原本</i>
+├── loop_summary.json         <i>イテレーション推移 + usage 集計</i>
+├── trace.jsonl               <i>全 LLM 呼び出しの構造化トレース (run_id 付き)</i>
+├── report.md                 <i>人間向けレポート (結合マトリクス含む)</i>
+└── dashboard.html            <i>viz/generate.py が生成する実行計器盤</i></pre>
+</section>
+
+<!-- ======================= 8. metrics ======================= -->
+<section id="metrics">
+  <div class="sec-head"><span class="sec-no">第八節</span><h2>指標の読み方</h2></div>
+  <table>
+    <thead><tr><th>指標</th><th>意味</th><th>読み方の注意</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">answered_rate</td><td>件数ベース回答率</td>
+        <td>ideation が難問仮説を増やすと<strong>下がるのが正常</strong>な場合がある</td></tr>
+      <tr><td class="mono">answered_rate_weighted</td><td>asked_count 重み付き回答率</td>
+        <td>運用上の実需が満たされているかを見る主指標</td></tr>
+      <tr><td class="mono">production_answered_rate_weighted</td><td>運用クエリのみの重み付き回答率</td>
+        <td>運用履歴フィードバックの効き目を直接示す</td></tr>
+      <tr><td class="mono">compiled_structurally_rate</td><td>plan が search フォールバックに落ちなかった率</td>
+        <td>スキーマがクエリを構造的に支えられている度合い</td></tr>
+      <tr><td class="mono">evidence_sufficient_rate</td><td>根拠十分と判定された率</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p class="note">
+    これらは <strong>LLM judge の自己申告に基づく</strong>。改善傾向の観測には十分だが、
+    品質の最終的な裏付けには hand-labeled eval fixture（期待 call_ids / 期待回答での決定論採点）が
+    必要であり、これは本デモの既知の残課題である。
+  </p>
+</section>
+
+<!-- ======================= 9. viz ======================= -->
+<section id="viz">
+  <div class="sec-head"><span class="sec-no">第九節</span><h2>可視化機構 (viz/)</h2></div>
+  <p>
+    <code>viz/generate.py</code> は本体パッケージに依存しない独立したデモ機構で、
+    run の出力ディレクトリを読んで <strong>外部依存ゼロ・オフライン閲覧可能な
+    単一 HTML ダッシュボード</strong>を生成する。
+  </p>
+  <pre class="tree">python3 viz/generate.py --run-dir output/demo --open</pre>
+  <p>掲載内容: ヘッダ計器（before/after の delta 付き）、パイプライン通過量、
+    イテレーション指標バー、<strong>LLM 呼び出しタイムライン</strong>（prompt 種別レーン × 実時間、
+    修復リトライは黄枠）、<strong>intent × field 結合マトリクス</strong>（intent-local ヒートマップ +
+    結合不全バナー）、クエリ試行エクスプローラ（フィルタ + plan / judge / 根拠の展開）、
+    スキーマカード（fill / evidence バー）、残ギャップと運用フィードバック。
+    実出力のサンプルは <a href="sample_dashboard.html">sample_dashboard.html</a>。</p>
+</section>
+</main>
+
+<footer>agentic-enrichment-demo / docs/architecture.html — README の補足資料。最終更新は git log を参照。</footer>
+</div>
+</body>
+</html>
